@@ -25,7 +25,7 @@ itertools.workspace = true
 tracing.workspace = true
 
 # phase2 dependencies
-amaru-uplc = { version = "0.1.0", optional = true }
+amaru-uplc = { version = "0.6.0", optional = true }
 
 [features]
 phase2 = ["amaru-uplc"]
