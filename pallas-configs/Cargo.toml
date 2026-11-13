@@ -17,7 +17,7 @@ pallas-crypto.workspace = true
 pallas-primitives.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-base64 = "0.22.0"
+base64 = "0.23.1"
 serde_with.workspace = true
 num-rational = "0.4.2"
 
