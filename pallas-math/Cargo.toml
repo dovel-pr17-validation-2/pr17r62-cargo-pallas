@@ -13,7 +13,7 @@ authors.workspace = true
 exclude = ["tests/data/*"]
 
 [dependencies]
-dashu-int = "0.4.1"
+dashu-int = "0.6.2"
 dashu-base = "0.4.1"
 regex = "1.10.5"
 thiserror.workspace = true
