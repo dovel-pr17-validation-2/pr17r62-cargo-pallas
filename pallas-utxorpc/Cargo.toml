@@ -46,4 +46,4 @@ unstable = ["pallas-traverse/unstable", "pallas-primitives/unstable"]
 hex.workspace = true
 serde_json.workspace = true
 pretty_assertions = "1.4.0"
-prost = "0.13"
+prost = "0.14"
