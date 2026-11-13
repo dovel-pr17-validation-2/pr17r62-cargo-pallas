@@ -1,0 +1,250 @@
+use std::collections::HashMap;
+
+use pallas_codec::minicbor::data::Type;
+use pallas_codec::minicbor::{Decode, Decoder, Encode, Encoder, decode, encode};
+
+use super::protocol::NetworkMagic;
+
+/// N2C-specific instantiation of the generic handshake version table.
+pub type VersionTable = super::protocol::VersionTable<VersionData>;
+
+const PROTOCOL_V1: u64 = 1;
+const PROTOCOL_V2: u64 = 32770;
+const PROTOCOL_V3: u64 = 32771;
+const PROTOCOL_V4: u64 = 32772;
+const PROTOCOL_V5: u64 = 32773;
+const PROTOCOL_V6: u64 = 32774;
+const PROTOCOL_V7: u64 = 32775;
+const PROTOCOL_V8: u64 = 32776;
+const PROTOCOL_V9: u64 = 32777;
+const PROTOCOL_V10: u64 = 32778;
+const PROTOCOL_V11: u64 = 32779;
+const PROTOCOL_V12: u64 = 32780;
+const PROTOCOL_V13: u64 = 32781;
+const PROTOCOL_V14: u64 = 32782;
+const PROTOCOL_V15: u64 = 32783;
+const PROTOCOL_V16: u64 = 32784;
+const PROTOCOL_V17: u64 = 32785;
+const PROTOCOL_V18: u64 = 32786;
+const PROTOCOL_V19: u64 = 32787;
+const PROTOCOL_V20: u64 = 32788;
+const PROTOCOL_V21: u64 = 32789;
+const PROTOCOL_V22: u64 = 32790;
+const PROTOCOL_V23: u64 = 32791;
+
+const PROTOCOL_DMQ_V1: u64 = 4097;
+
+impl VersionTable {
+    /// Build a version table offering every N2C version from 1 up.
+    pub fn v1_and_above(network_magic: u64) -> VersionTable {
+        let values = vec![
+            (PROTOCOL_V1, VersionData(network_magic, None)),
+            (PROTOCOL_V2, VersionData(network_magic, None)),
+            (PROTOCOL_V3, VersionData(network_magic, None)),
+            (PROTOCOL_V4, VersionData(network_magic, None)),
+            (PROTOCOL_V5, VersionData(network_magic, None)),
+            (PROTOCOL_V6, VersionData(network_magic, None)),
+            (PROTOCOL_V7, VersionData(network_magic, None)),
+            (PROTOCOL_V8, VersionData(network_magic, None)),
+            (PROTOCOL_V9, VersionData(network_magic, None)),
+            (PROTOCOL_V10, VersionData(network_magic, None)),
+            (PROTOCOL_V11, VersionData(network_magic, None)),
+            (PROTOCOL_V12, VersionData(network_magic, None)),
+            (PROTOCOL_V13, VersionData(network_magic, None)),
+            (PROTOCOL_V14, VersionData(network_magic, None)),
+            (PROTOCOL_V15, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V16, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V17, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V18, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V19, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V20, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V21, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V22, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V23, VersionData(network_magic, Some(false))),
+        ]
+        .into_iter()
+        .collect::<HashMap<u64, VersionData>>();
+
+        VersionTable { values }
+    }
+
+    /// Build a version table offering only N2C version 10.
+    pub fn only_v10(network_magic: u64) -> VersionTable {
+        let values = vec![(PROTOCOL_V10, VersionData(network_magic, None))]
+            .into_iter()
+            .collect::<HashMap<u64, VersionData>>();
+
+        VersionTable { values }
+    }
+
+    /// Build a version table offering every N2C version from 10 up.
+    pub fn v10_and_above(network_magic: u64) -> VersionTable {
+        let values = vec![
+            (PROTOCOL_V10, VersionData(network_magic, None)),
+            (PROTOCOL_V11, VersionData(network_magic, None)),
+            (PROTOCOL_V12, VersionData(network_magic, None)),
+            (PROTOCOL_V13, VersionData(network_magic, None)),
+            (PROTOCOL_V14, VersionData(network_magic, None)),
+            (PROTOCOL_V15, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V16, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V17, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V18, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V19, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V20, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V21, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V22, VersionData(network_magic, Some(false))),
+            (PROTOCOL_V23, VersionData(network_magic, Some(false))),
+        ]
+        .into_iter()
+        .collect::<HashMap<u64, VersionData>>();
+
+        VersionTable { values }
+    }
+
+    /// Build a single-entry version table for N2C v15 query-mode handshake.
+    pub fn v15_with_query(network_magic: u64) -> VersionTable {
+        let values = vec![(PROTOCOL_V15, VersionData(network_magic, Some(true)))]
+            .into_iter()
+            .collect::<HashMap<u64, VersionData>>();
+
+        VersionTable { values }
+    }
+
+    /// Build a single-entry version table for the DMQ handshake.
+    pub fn dmq(network_magic: u64) -> VersionTable {
+        let values = vec![(PROTOCOL_DMQ_V1, VersionData(network_magic, Some(false)))]
+            .into_iter()
+            .collect::<HashMap<u64, VersionData>>();
+
+        VersionTable { values }
+    }
+}
+
+/// Per-version payload for the N2C handshake: `(network_magic, query?)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VersionData(NetworkMagic, Option<bool>);
+
+impl VersionData {
+    /// Build a [`VersionData`] from its components.
+    pub fn new(magic: NetworkMagic, param: Option<bool>) -> Self {
+        Self(magic, param)
+    }
+}
+
+/// Mirrors `acceptableVersion` for `NodeToClientVersionData` in ouroboros-network:
+/// the network magic must match and query mode is requested if either side
+/// requests it.
+impl super::protocol::NegotiateVersionData for VersionData {
+    /// Negotiate our payload against the proposed one, per the rules above.
+    fn negotiate(&self, proposed: &Self) -> Result<Self, String> {
+        if self.0 != proposed.0 {
+            return Err(format!(
+                "network magic mismatch: ours {}, proposed {}",
+                self.0, proposed.0
+            ));
+        }
+
+        // Versions 15 and up carry the query flag; earlier ones do not. The two
+        // sides must use the same payload shape for a version.
+        let query = match (self.1, proposed.1) {
+            (Some(ours), Some(theirs)) => Some(ours || theirs),
+            (None, None) => None,
+            _ => {
+                return Err(format!(
+                    "version data shape mismatch: ours {self:?}, proposed {proposed:?}"
+                ));
+            }
+        };
+
+        Ok(VersionData(self.0, query))
+    }
+}
+
+impl Encode<()> for VersionData {
+    fn encode<W: encode::Write>(
+        &self,
+        e: &mut Encoder<W>,
+        _ctx: &mut (),
+    ) -> Result<(), encode::Error<W::Error>> {
+        match self.1 {
+            None => {
+                e.u64(self.0)?;
+            }
+            Some(is_query) => {
+                e.array(2)?;
+                e.u64(self.0)?;
+                e.bool(is_query)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<'b> Decode<'b, ()> for VersionData {
+    fn decode(d: &mut Decoder<'b>, _ctx: &mut ()) -> Result<Self, decode::Error> {
+        match d.datatype()? {
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+                let network_magic = d.u64()?;
+                Ok(Self(network_magic, None))
+            }
+            Type::Array => {
+                d.array()?;
+                let network_magic = d.u64()?;
+                let is_query = d.bool()?;
+                Ok(Self(network_magic, Some(is_query)))
+            }
+            _ => Err(decode::Error::message("unknown type for VersionData")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::super::protocol::NegotiateVersionData;
+    use super::*;
+
+    /// Query mode is requested when either side requests it.
+    #[test]
+    fn query_if_either_side_asks() {
+        let ours = VersionData::new(2, Some(false));
+        let theirs = VersionData::new(2, Some(true));
+
+        assert_eq!(
+            ours.negotiate(&theirs).unwrap(),
+            VersionData::new(2, Some(true))
+        );
+        assert_eq!(
+            theirs.negotiate(&ours).unwrap(),
+            VersionData::new(2, Some(true))
+        );
+    }
+
+    /// Versions without a query flag negotiate to a payload without one.
+    #[test]
+    fn versions_without_query_stay_without_query() {
+        let ours = VersionData::new(2, None);
+
+        assert_eq!(ours.negotiate(&ours).unwrap(), ours);
+    }
+
+    /// A payload with a query flag and one without are refused for the same version.
+    #[test]
+    fn refuses_a_payload_of_another_shape() {
+        let modern = VersionData::new(2, Some(false));
+        let legacy = VersionData::new(2, None);
+
+        assert!(modern.negotiate(&legacy).is_err());
+        assert!(legacy.negotiate(&modern).is_err());
+    }
+
+    /// Payloads for different networks are refused.
+    #[test]
+    fn refuses_a_different_network_magic() {
+        assert!(
+            VersionData::new(2, Some(false))
+                .negotiate(&VersionData::new(1, Some(false)))
+                .is_err()
+        );
+    }
+}

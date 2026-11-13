@@ -1,0 +1,44 @@
+[package]
+name = "pallas-network2"
+description = "Ouroboros networking stack for P2P interactions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/pallas"
+readme = "README.md"
+
+[dependencies]
+futures = "0.3.31"
+trait-variant = "0.1.2"
+rand = { workspace = true, optional = true }
+tokio = { version = "1.45.1", optional = true, features = ["full"] }
+pallas-codec.workspace = true
+chrono.workspace = true
+opentelemetry = "0.30.0"
+tracing.workspace = true
+byteorder.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+# Pinned: cddl 0.10.7 regressed map entries whose key is a type-rule reference
+# (`bitmaps = { * word16 => word64 }` with `word16 = uint`), rejecting every key
+# as unexpected. Inline key types still validate, named ones do not. Still broken
+# on cddl master as of 2026-08-25. Relax once a release carries the fix.
+cddl = { version = "=0.10.6", optional = true }
+
+[features]
+emulation = ["tokio", "rand"]
+default = ["emulation"]
+blueprint = ["dep:cddl"]
+
+[dev-dependencies]
+tokio = { version = "1.45.1", features = ["full", "test-util"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
+
+[[bench]]
+name = "protocol"
+harness = false

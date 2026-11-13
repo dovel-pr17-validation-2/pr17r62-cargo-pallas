@@ -1,0 +1,277 @@
+use std::marker::PhantomData;
+
+use pallas_codec::Fragment;
+use tracing::{debug, warn};
+
+use super::{
+    Error, Message, NegotiateVersionData, RefuseReason, State, VersionNumber, VersionTable,
+};
+use crate::multiplexer;
+
+/// Handshake server agent generic over the version-data payload type.
+pub struct Server<D>(State, multiplexer::ChannelBuffer, PhantomData<D>);
+
+impl<D> Server<D>
+where
+    D: std::fmt::Debug + Clone + std::cmp::PartialEq,
+    Message<D>: Fragment,
+{
+    /// Build a server over a freshly subscribed agent channel.
+    pub fn new(channel: multiplexer::AgentChannel) -> Self {
+        Self(
+            State::Propose,
+            multiplexer::ChannelBuffer::new(channel),
+            PhantomData {},
+        )
+    }
+
+    /// Current state-machine state.
+    pub fn state(&self) -> &State {
+        &self.0
+    }
+
+    /// True if the protocol has terminated.
+    pub fn is_done(&self) -> bool {
+        self.0 == State::Done
+    }
+
+    /// True if the server holds agency in the current state.
+    pub fn has_agency(&self) -> bool {
+        matches!(self.state(), State::Confirm)
+    }
+
+    fn assert_agency_is_ours(&self) -> Result<(), Error> {
+        if !self.has_agency() {
+            Err(Error::AgencyIsTheirs)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn assert_agency_is_theirs(&self) -> Result<(), Error> {
+        if self.has_agency() {
+            Err(Error::AgencyIsOurs)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn assert_outbound_state(&self, msg: &Message<D>) -> Result<(), Error> {
+        match (&self.0, msg) {
+            (State::Confirm, Message::Accept(..)) => Ok(()),
+            (State::Confirm, Message::Refuse(_)) => Ok(()),
+            _ => Err(Error::InvalidOutbound),
+        }
+    }
+
+    fn assert_inbound_state(&self, msg: &Message<D>) -> Result<(), Error> {
+        match (&self.0, msg) {
+            (State::Propose, Message::Propose(..)) => Ok(()),
+            _ => Err(Error::InvalidInbound),
+        }
+    }
+
+    /// Low-level send.
+    pub async fn send_message(&mut self, msg: &Message<D>) -> Result<(), Error> {
+        self.assert_agency_is_ours()?;
+        self.assert_outbound_state(msg)?;
+        self.1.send_msg_chunks(msg).await.map_err(Error::Plexer)?;
+
+        Ok(())
+    }
+
+    /// Low-level receive.
+    pub async fn recv_message(&mut self) -> Result<Message<D>, Error> {
+        self.assert_agency_is_theirs()?;
+        let msg = self.1.recv_full_msg().await.map_err(Error::Plexer)?;
+        self.assert_inbound_state(&msg)?;
+
+        Ok(msg)
+    }
+
+    /// Receive the client's `Propose` message and return the offered versions.
+    pub async fn receive_proposed_versions(&mut self) -> Result<VersionTable<D>, Error> {
+        match self.recv_message().await? {
+            Message::Propose(v) => {
+                self.0 = State::Confirm;
+                Ok(v)
+            }
+            _ => Err(Error::InvalidOutbound),
+        }
+    }
+
+    /// Send an `Accept` confirming the given version and payload.
+    pub async fn accept_version(
+        &mut self,
+        version: VersionNumber,
+        extra_params: D,
+    ) -> Result<(), Error> {
+        let message = Message::Accept(version, extra_params);
+        self.send_message(&message).await?;
+        self.0 = State::Done;
+
+        Ok(())
+    }
+
+    /// Send a `Refuse` with the given reason.
+    pub async fn refuse(&mut self, reason: RefuseReason) -> Result<(), Error> {
+        let message = Message::Refuse(reason);
+        self.send_message(&message).await?;
+        self.0 = State::Done;
+
+        Ok(())
+    }
+
+    /// Perform a handshake with the client
+    ///
+    /// Performs a full handshake with the client, where `versions` are the
+    /// acceptable versions supported by the server.
+    ///
+    /// Deprecated: a version is accepted only when both sides propose
+    /// identical version data, so nodes that propose different peer sharing
+    /// or query flags are refused. Use [`Server::handshake_negotiated`],
+    /// which negotiates the version data instead.
+    #[deprecated(
+        since = "1.5.0",
+        note = "requires identical version data, so nodes that propose different \
+                peer sharing or query flags are refused; use `handshake_negotiated`"
+    )]
+    pub async fn handshake(
+        &mut self,
+        versions: VersionTable<D>,
+    ) -> Result<Option<(VersionNumber, D)>, Error> {
+        // receive proposed versions
+        let client_versions = self
+            .receive_proposed_versions()
+            .await?
+            .values
+            .into_iter()
+            .collect::<Vec<(u64, D)>>();
+
+        // find highest intersect with our version table (TODO: improve)
+        let mut versions = versions.values.into_iter().collect::<Vec<(u64, D)>>();
+
+        versions.sort_by_key(|v| std::cmp::Reverse(v.0));
+
+        for (ver_num, ver_data) in versions.clone() {
+            for (client_ver_num, client_ver_data) in client_versions.clone() {
+                if ver_num == client_ver_num {
+                    if ver_data == client_ver_data {
+                        // found a version number and extra data match
+                        debug!("accepting hs with ({}, {:?})", ver_num, ver_data);
+
+                        self.accept_version(ver_num, ver_data.clone()).await?;
+
+                        return Ok(Some((ver_num, ver_data)));
+                    } else {
+                        warn!(
+                            "rejecting hs as params not acceptable - server: {:?}, client: {:?}",
+                            ver_data, client_ver_data
+                        );
+
+                        // found version number match but extra data not acceptable
+                        self.refuse(RefuseReason::Refused(
+                            ver_num,
+                            "Proposed extra params don't match".into(),
+                        ))
+                        .await?;
+
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        warn!(
+            "rejecting hs as no version intersect found - server: {:?}, client: {:?}",
+            versions, client_versions
+        );
+
+        // failed to find a version number intersection
+        self.refuse(RefuseReason::VersionMismatch(
+            versions.into_iter().map(|(num, _)| num).collect(),
+        ))
+        .await?;
+
+        Ok(None)
+    }
+
+    /// Perform a handshake with the client
+    ///
+    /// Performs a full handshake with the client, where `versions` are the
+    /// acceptable versions supported by the server. The highest version number
+    /// offered by both sides is selected, and its version data is negotiated
+    /// with [`NegotiateVersionData`] as the network specification describes;
+    /// the returned payload is the negotiated one sent in `MsgAcceptVersion`.
+    pub async fn handshake_negotiated(
+        &mut self,
+        versions: VersionTable<D>,
+    ) -> Result<Option<(VersionNumber, D)>, Error>
+    where
+        D: NegotiateVersionData,
+    {
+        // receive proposed versions
+        let client_versions = self
+            .receive_proposed_versions()
+            .await?
+            .values
+            .into_iter()
+            .collect::<Vec<(u64, D)>>();
+
+        // find the highest version number offered by both sides
+        let mut versions = versions.values.into_iter().collect::<Vec<(u64, D)>>();
+
+        versions.sort_by_key(|v| std::cmp::Reverse(v.0));
+
+        for (ver_num, ver_data) in versions.clone() {
+            for (client_ver_num, client_ver_data) in client_versions.clone() {
+                if ver_num == client_ver_num {
+                    match ver_data.negotiate(&client_ver_data) {
+                        Ok(accepted) => {
+                            debug!("accepting hs with ({}, {:?})", ver_num, accepted);
+
+                            self.accept_version(ver_num, accepted.clone()).await?;
+
+                            return Ok(Some((ver_num, accepted)));
+                        }
+                        Err(reason) => {
+                            warn!(
+                                "rejecting hs as params not acceptable - server: {:?}, client: {:?}: {}",
+                                ver_data, client_ver_data, reason
+                            );
+
+                            // found version number match but extra data not acceptable
+                            self.refuse(RefuseReason::Refused(ver_num, reason)).await?;
+
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+
+        warn!(
+            "rejecting hs as no version intersect found - server: {:?}, client: {:?}",
+            versions, client_versions
+        );
+
+        // failed to find a version number intersection
+        self.refuse(RefuseReason::VersionMismatch(
+            versions.into_iter().map(|(num, _)| num).collect(),
+        ))
+        .await?;
+
+        Ok(None)
+    }
+
+    /// Discard the protocol wrapper and return the raw agent channel.
+    pub fn unwrap(self) -> multiplexer::AgentChannel {
+        self.1.unwrap()
+    }
+}
+
+/// Node-to-node handshake server.
+pub type N2NServer = Server<super::n2n::VersionData>;
+
+/// Node-to-client handshake server.
+pub type N2CServer = Server<super::n2c::VersionData>;

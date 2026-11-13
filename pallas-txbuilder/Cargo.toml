@@ -1,0 +1,23 @@
+[package]
+name = "pallas-txbuilder"
+description = "An ergonomic Cardano transaction builder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+documentation = "https://docs.rs/pallas-txbuilder"
+readme = "README.md"
+authors.workspace = true
+
+[dependencies]
+pallas-codec.workspace = true
+pallas-crypto.workspace = true
+pallas-primitives.workspace = true
+pallas-traverse.workspace = true
+pallas-addresses.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true

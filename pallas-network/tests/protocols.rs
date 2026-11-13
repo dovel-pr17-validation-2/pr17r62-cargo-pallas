@@ -1,0 +1,2465 @@
+use hex::FromHex;
+use pallas_codec::utils::{
+    AnyCbor, AnyUInt, Bytes, CborWrap, KeyValuePairs, MaybeIndefArray, Nullable,
+};
+use pallas_crypto::hash::Hash;
+use pallas_network::miniprotocols::localmsgsubmission::DmqMsgRejectReason;
+use pallas_network::miniprotocols::localstate::queries_v16::{
+    self, Addr, Addrs, ChainBlockNumber, Constr, DatumOption, Fraction, GenesisConfig, PlutusData,
+    PoolMetadata, PoolParams, RationalNumber, Relay, StakeAddr, StakeSnapshots, Stakes,
+    SystemStart, UnitInterval, Value,
+};
+use pallas_network::miniprotocols::localtxsubmission::SMaybe;
+use pallas_network::{
+    facades::{DmqClient, NodeClient, PeerClient, PeerServer},
+    miniprotocols::{
+        MAINNET_MAGIC, Point, blockfetch,
+        blockfetch::BlockRequest,
+        chainsync::{self, NextResponse},
+        chainsync::{ClientRequest, HeaderContent, Tip},
+        handshake,
+        handshake::n2n::VersionData,
+        localmsgnotification,
+        localmsgsubmission::DmqMsg,
+        localstate,
+        localstate::ClientQueryRequest,
+        localtxsubmission, peersharing,
+        peersharing::PeerAddress,
+        txsubmission,
+        txsubmission::{EraTxBody, TxIdAndSize},
+    },
+    multiplexer::{Bearer, Plexer},
+};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4},
+    path::Path,
+    time::Duration,
+};
+
+use tokio::net::TcpListener;
+
+#[cfg(unix)]
+use tokio::net::UnixListener;
+
+#[tokio::test]
+#[ignore]
+pub async fn chainsync_history_happy_path() {
+    let mut peer = PeerClient::connect("preview-node.world.dev.cardano.org:30002", 2)
+        .await
+        .unwrap();
+
+    let client = peer.chainsync();
+
+    let known_point = Point::Specific(
+        1654413,
+        hex::decode("7de1f036df5a133ce68a82877d14354d0ba6de7625ab918e75f3e2ecb29771c2").unwrap(),
+    );
+
+    let (point, _) = client
+        .find_intersect(vec![known_point.clone()])
+        .await
+        .unwrap();
+
+    println!("{point:?}");
+
+    assert!(matches!(client.state(), chainsync::State::Idle));
+
+    match point {
+        Some(point) => assert_eq!(point, known_point),
+        None => panic!("expected point"),
+    }
+
+    let next = client.request_next().await.unwrap();
+
+    match next {
+        NextResponse::RollBackward(point, _) => assert_eq!(point, known_point),
+        _ => panic!("expected rollback"),
+    }
+
+    assert!(matches!(client.state(), chainsync::State::Idle));
+
+    for _ in 0..10 {
+        let next = client.request_next().await.unwrap();
+
+        match next {
+            NextResponse::RollForward(_, _) => (),
+            _ => panic!("expected roll-forward"),
+        }
+
+        assert!(matches!(client.state(), chainsync::State::Idle));
+    }
+
+    client.send_done().await.unwrap();
+
+    assert!(matches!(client.state(), chainsync::State::Done));
+}
+
+#[tokio::test]
+#[ignore]
+pub async fn chainsync_tip_happy_path() {
+    let mut peer = PeerClient::connect("preview-node.world.dev.cardano.org:30002", 2)
+        .await
+        .unwrap();
+
+    let client = peer.chainsync();
+
+    client.intersect_tip().await.unwrap();
+
+    assert!(matches!(client.state(), chainsync::State::Idle));
+
+    let next = client.request_next().await.unwrap();
+
+    assert!(matches!(next, NextResponse::RollBackward(..)));
+
+    let mut await_count = 0;
+
+    for _ in 0..4 {
+        let next = if client.has_agency() {
+            client.request_next().await.unwrap()
+        } else {
+            await_count += 1;
+            client.recv_while_must_reply().await.unwrap()
+        };
+
+        match next {
+            NextResponse::RollForward(_, _) => (),
+            NextResponse::Await => (),
+            _ => panic!("expected roll-forward or await"),
+        }
+    }
+
+    assert!(await_count > 0, "tip was never reached");
+
+    client.send_done().await.unwrap();
+
+    assert!(matches!(client.state(), chainsync::State::Done));
+}
+
+#[tokio::test]
+#[ignore]
+pub async fn blockfetch_happy_path() {
+    let mut peer = PeerClient::connect("preview-node.world.dev.cardano.org:30002", 2)
+        .await
+        .unwrap();
+
+    let client = peer.blockfetch();
+
+    let known_point = Point::Specific(
+        1654413,
+        hex::decode("7de1f036df5a133ce68a82877d14354d0ba6de7625ab918e75f3e2ecb29771c2").unwrap(),
+    );
+
+    let range_ok = client
+        .request_range((known_point.clone(), known_point))
+        .await;
+
+    assert!(matches!(client.state(), blockfetch::State::Streaming));
+
+    println!("streaming...");
+
+    assert!(range_ok.is_ok());
+
+    for _ in 0..1 {
+        let next = client.recv_while_streaming().await.unwrap();
+
+        match next {
+            Some(body) => assert_eq!(body.len(), 3251),
+            _ => panic!("expected block body"),
+        }
+
+        assert!(matches!(client.state(), blockfetch::State::Streaming));
+    }
+
+    let next = client.recv_while_streaming().await.unwrap();
+
+    assert!(next.is_none());
+
+    client.send_done().await.unwrap();
+
+    assert!(matches!(client.state(), blockfetch::State::Done));
+}
+
+#[tokio::test]
+#[ignore]
+pub async fn blockfetch_server_and_client_happy_path() {
+    let block_bodies = vec![
+        hex::decode("deadbeefdeadbeef").unwrap(),
+        hex::decode("c0ffeec0ffeec0ffee").unwrap(),
+    ];
+
+    let point = Point::Specific(
+        1337,
+        hex::decode("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap(),
+    );
+
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30003))
+        .await
+        .unwrap();
+
+    let server = tokio::spawn({
+        let bodies = block_bodies.clone();
+        let point = point.clone();
+        async move {
+            // server setup
+
+            let mut peer_server = PeerServer::accept(&listener, 0).await.unwrap();
+
+            let server_bf = peer_server.blockfetch();
+
+            // server receives range from client, sends blocks
+
+            let BlockRequest(range_request) = server_bf.recv_while_idle().await.unwrap().unwrap();
+
+            assert_eq!(range_request, (point.clone(), point.clone()));
+            assert_eq!(*server_bf.state(), blockfetch::State::Busy);
+
+            server_bf.send_block_range(bodies).await.unwrap();
+
+            assert_eq!(*server_bf.state(), blockfetch::State::Idle);
+
+            // server receives range from client, sends NoBlocks
+
+            let BlockRequest(_) = server_bf.recv_while_idle().await.unwrap().unwrap();
+
+            server_bf.send_block_range(vec![]).await.unwrap();
+
+            assert_eq!(*server_bf.state(), blockfetch::State::Idle);
+
+            assert!(server_bf.recv_while_idle().await.unwrap().is_none());
+
+            assert_eq!(*server_bf.state(), blockfetch::State::Done);
+        }
+    });
+
+    let client = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let mut client_to_server_conn = PeerClient::connect("localhost:30003", 0).await.unwrap();
+
+        let client_bf = client_to_server_conn.blockfetch();
+
+        // client sends request range
+
+        client_bf
+            .send_request_range((point.clone(), point.clone()))
+            .await
+            .unwrap();
+
+        assert!(client_bf.recv_while_busy().await.unwrap().is_some());
+
+        // client receives blocks until idle
+
+        let mut received_bodies = Vec::new();
+
+        while let Some(received_body) = client_bf.recv_while_streaming().await.unwrap() {
+            received_bodies.push(received_body)
+        }
+
+        assert_eq!(received_bodies, block_bodies);
+
+        // client sends request range
+
+        client_bf
+            .send_request_range((point.clone(), point.clone()))
+            .await
+            .unwrap();
+
+        // recv_while_busy returns None for NoBlocks message
+        assert!(client_bf.recv_while_busy().await.unwrap().is_none());
+
+        // client sends done
+
+        client_bf.send_done().await.unwrap();
+    });
+
+    tokio::try_join!(client, server).unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+pub async fn chainsync_server_and_client_happy_path_n2n() {
+    let point1 = Point::Specific(1, vec![0x01]);
+    let point2 = Point::Specific(2, vec![0x02]);
+
+    let server = tokio::spawn({
+        let point1 = point1.clone();
+        let point2 = point2.clone();
+        async move {
+            // server setup
+
+            let server_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30002))
+                .await
+                .unwrap();
+
+            let (bearer, _) = Bearer::accept_tcp(&server_listener).await.unwrap();
+
+            let mut server_plexer = Plexer::new(bearer);
+
+            let mut server_hs: handshake::Server<VersionData> =
+                handshake::Server::new(server_plexer.subscribe_server(0));
+            let mut server_cs = chainsync::N2NServer::new(server_plexer.subscribe_server(2));
+
+            let server_plexer = server_plexer.spawn();
+
+            server_hs.receive_proposed_versions().await.unwrap();
+            server_hs
+                .accept_version(10, VersionData::new(0, false, None, None))
+                .await
+                .unwrap();
+
+            // server receives find intersect from client, sends intersect point
+
+            assert_eq!(*server_cs.state(), chainsync::State::Idle);
+
+            let intersect_points = match server_cs.recv_while_idle().await.unwrap().unwrap() {
+                ClientRequest::Intersect(points) => points,
+                ClientRequest::RequestNext => panic!("unexpected message"),
+            };
+
+            assert_eq!(*server_cs.state(), chainsync::State::Intersect);
+            assert_eq!(intersect_points, vec![point2.clone(), point1.clone()]);
+
+            server_cs
+                .send_intersect_found(point2.clone(), Tip(point2.clone(), 1337))
+                .await
+                .unwrap();
+
+            assert_eq!(*server_cs.state(), chainsync::State::Idle);
+
+            // server receives request next from client, sends rollbackwards
+
+            match server_cs.recv_while_idle().await.unwrap().unwrap() {
+                ClientRequest::RequestNext => (),
+                ClientRequest::Intersect(_) => panic!("unexpected message"),
+            };
+
+            assert_eq!(*server_cs.state(), chainsync::State::CanAwait);
+
+            server_cs
+                .send_roll_backward(point2.clone(), Tip(point2.clone(), 1337))
+                .await
+                .unwrap();
+
+            assert_eq!(*server_cs.state(), chainsync::State::Idle);
+
+            // server receives request next from client, sends rollforwards
+
+            match server_cs.recv_while_idle().await.unwrap().unwrap() {
+                ClientRequest::RequestNext => (),
+                ClientRequest::Intersect(_) => panic!("unexpected message"),
+            };
+
+            assert_eq!(*server_cs.state(), chainsync::State::CanAwait);
+
+            let header2 = HeaderContent {
+                variant: 1,
+                byron_prefix: None,
+                cbor: hex::decode("c0ffeec0ffeec0ffee").unwrap(),
+            };
+
+            server_cs
+                .send_roll_forward(header2, Tip(point2.clone(), 1337))
+                .await
+                .unwrap();
+
+            assert_eq!(*server_cs.state(), chainsync::State::Idle);
+
+            // server receives request next from client, sends await reply
+            // then rollforwards
+
+            match server_cs.recv_while_idle().await.unwrap().unwrap() {
+                ClientRequest::RequestNext => (),
+                ClientRequest::Intersect(_) => panic!("unexpected message"),
+            };
+
+            assert_eq!(*server_cs.state(), chainsync::State::CanAwait);
+
+            server_cs.send_await_reply().await.unwrap();
+
+            assert_eq!(*server_cs.state(), chainsync::State::MustReply);
+
+            let header1 = HeaderContent {
+                variant: 1,
+                byron_prefix: None,
+                cbor: hex::decode("deadbeefdeadbeef").unwrap(),
+            };
+
+            server_cs
+                .send_roll_forward(header1, Tip(point1.clone(), 123))
+                .await
+                .unwrap();
+
+            assert_eq!(*server_cs.state(), chainsync::State::Idle);
+
+            // server receives client done
+
+            assert!(server_cs.recv_while_idle().await.unwrap().is_none());
+            assert_eq!(*server_cs.state(), chainsync::State::Done);
+
+            server_plexer.abort().await;
+        }
+    });
+
+    let client = tokio::spawn(async move {
+        let mut client_to_server_conn = PeerClient::connect("localhost:30002", 0).await.unwrap();
+
+        let client_cs = client_to_server_conn.chainsync();
+
+        // client sends find intersect
+
+        let intersect_response = client_cs
+            .find_intersect(vec![point2.clone(), point1.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(intersect_response.0, Some(point2.clone()));
+        assert_eq!(intersect_response.1.0, point2.clone());
+        assert_eq!(intersect_response.1.1, 1337);
+
+        // client sends msg request next
+
+        client_cs.send_request_next().await.unwrap();
+
+        // client receives rollback
+
+        match client_cs.recv_while_can_await().await.unwrap() {
+            NextResponse::RollBackward(point, tip) => {
+                assert_eq!(point, point2.clone());
+                assert_eq!(tip.0, point2.clone());
+                assert_eq!(tip.1, 1337);
+            }
+            _ => panic!("unexpected response"),
+        }
+
+        client_cs.send_request_next().await.unwrap();
+
+        // client receives roll forward
+
+        match client_cs.recv_while_can_await().await.unwrap() {
+            NextResponse::RollForward(content, tip) => {
+                assert_eq!(content.cbor, hex::decode("c0ffeec0ffeec0ffee").unwrap());
+                assert_eq!(tip.0, point2.clone());
+                assert_eq!(tip.1, 1337);
+            }
+            _ => panic!("unexpected response"),
+        }
+
+        // client sends msg request next
+
+        client_cs.send_request_next().await.unwrap();
+
+        // client receives await
+
+        match client_cs.recv_while_can_await().await.unwrap() {
+            NextResponse::Await => (),
+            _ => panic!("unexpected response"),
+        }
+
+        match client_cs.recv_while_must_reply().await.unwrap() {
+            NextResponse::RollForward(content, tip) => {
+                assert_eq!(content.cbor, hex::decode("deadbeefdeadbeef").unwrap());
+                assert_eq!(tip.0, point1.clone());
+                assert_eq!(tip.1, 123);
+            }
+            _ => panic!("unexpected response"),
+        }
+
+        // client sends done
+
+        client_cs.send_done().await.unwrap();
+    });
+
+    tokio::try_join!(client, server).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+pub async fn local_state_query_server_and_client_happy_path() {
+    let server = tokio::spawn({
+        async move {
+            // server setup
+            let socket_path = Path::new("node1.socket");
+
+            if socket_path.exists() {
+                fs::remove_file(socket_path).unwrap();
+            }
+
+            let listener = UnixListener::bind(socket_path).unwrap();
+
+            let mut server = pallas_network::facades::NodeServer::accept(&listener, 0)
+                .await
+                .unwrap();
+
+            // wait for acquire request from client
+
+            let maybe_acquire = server.statequery().recv_while_idle().await.unwrap();
+
+            assert!(maybe_acquire.is_some());
+            assert_eq!(*server.statequery().state(), localstate::State::Acquiring);
+
+            server.statequery().send_acquired().await.unwrap();
+
+            assert_eq!(*server.statequery().state(), localstate::State::Acquired);
+
+            // server receives query from client
+
+            let query: queries_v16::Request =
+                match server.statequery().recv_while_acquired().await.unwrap() {
+                    ClientQueryRequest::Query(q) => q.into_decode().unwrap(),
+                    x => panic!(
+                        "(While expecting `GetSystemStart`) \
+                                 Unexpected message from client: {x:?}"
+                    ),
+                };
+
+            assert_eq!(query, queries_v16::Request::GetSystemStart);
+            assert_eq!(*server.statequery().state(), localstate::State::Querying);
+
+            let result = AnyCbor::from_encode(SystemStart {
+                year: 2020.into(),
+                day_of_year: 1,
+                picoseconds_of_day: 999999999.into(),
+            });
+
+            server.statequery().send_result(result).await.unwrap();
+
+            assert_eq!(*server.statequery().state(), localstate::State::Acquired);
+
+            // server receives query from client
+            let query: queries_v16::Request =
+                match server.statequery().recv_while_acquired().await.unwrap() {
+                    ClientQueryRequest::Query(q) => q.into_decode().unwrap(),
+                    x => panic!(
+                        "(While expecting `GetChainBlockNo`) \
+                                 Unexpected message from client: {x:?}"
+                    ),
+                };
+
+            assert_eq!(query, queries_v16::Request::GetChainBlockNo);
+            assert_eq!(*server.statequery().state(), localstate::State::Querying);
+
+            let result = AnyCbor::from_encode(ChainBlockNumber {
+                slot_timeline: 1,
+                block_number: 2143789,
+            });
+
+            server.statequery().send_result(result).await.unwrap();
+
+            assert_eq!(*server.statequery().state(), localstate::State::Acquired);
+
+            // server receives query from client
+
+            let query: queries_v16::Request =
+                match server.statequery().recv_while_acquired().await.unwrap() {
+                    ClientQueryRequest::Query(q) => q.into_decode().unwrap(),
+                    x => panic!(
+                        "(While expecting `GetStakeDistribution`) \
+                                 Unexpected message from client: {x:?}"
+                    ),
+                };
+
+            assert_eq!(
+                query,
+                queries_v16::Request::LedgerQuery(queries_v16::LedgerQuery::BlockQuery(
+                    5,
+                    queries_v16::BlockQuery::GetStakeDistribution,
+                ),)
+            );
+            assert_eq!(*server.statequery().state(), localstate::State::Querying);
+
+            let rational = RationalNumber {
+                numerator: 10,
+                denominator: 20,
+            };
+            let pool = localstate::queries_v16::Pool {
+                stakes: rational.clone(),
+                hashes: b"pool1qv4qgv62s3ha74p0643nexee9zvcdydcyahqqnavhj90zheuykz"
+                    .to_vec()
+                    .into(),
+            };
+
+            let pools: Vec<(Bytes, _)> = vec![(
+                b"pool1qvfw4r3auysa5mhpr90n7mmdhs55js8gdywh0y2e3sy6568j2wp"
+                    .to_vec()
+                    .into(),
+                pool,
+            )];
+
+            let result = AnyCbor::from_encode(KeyValuePairs::from(pools));
+            server.statequery().send_result(result).await.unwrap();
+
+            // server receives query from client
+
+            let query: queries_v16::Request =
+                match server.statequery().recv_while_acquired().await.unwrap() {
+                    ClientQueryRequest::Query(q) => q.into_decode().unwrap(),
+                    x => panic!(
+                        "(While expecting `GetUTxOByAddress`) \
+                                 Unexpected message from client: {x:?}"
+                    ),
+                };
+
+            let addr_hex = "981D186018CE18F718FB185F188918A918C7186A186518AC18DD1874186D189E188410184D186F1882184D187D18C4184F1842187F18CA18A118DD";
+            let addr = hex::decode(addr_hex).unwrap();
+            let addr: Addr = addr.to_vec().into();
+            let addrs: Addrs = Vec::from([addr]);
+
+            assert_eq!(
+                query,
+                queries_v16::Request::LedgerQuery(queries_v16::LedgerQuery::BlockQuery(
+                    5,
+                    queries_v16::BlockQuery::GetUTxOByAddress(addrs),
+                ),)
+            );
+
+            assert_eq!(*server.statequery().state(), localstate::State::Querying);
+
+            let tx_hex = "1e4e5cf2889d52f1745b941090f04a65dea6ce56c5e5e66e69f65c8e36347c17";
+            let txbytes: [u8; 32] = hex::decode(tx_hex).unwrap().try_into().unwrap();
+            let transaction_id = Hash::from(txbytes);
+            let index = AnyUInt::MajorByte(2);
+            let lovelace = AnyUInt::MajorByte(2);
+            let datum_cbor = PlutusData::Constr(Constr {
+                fields: MaybeIndefArray::Indef(vec![
+                    PlutusData::Constr(Constr {
+                        fields: MaybeIndefArray::Indef(vec![PlutusData::BigInt(
+                            queries_v16::BigInt::Int(3764868539i64.into()),
+                        )]),
+                        tag: 121,
+                        any_constructor: None,
+                    }),
+                    PlutusData::BigInt(queries_v16::BigInt::Int(1733882006000i64.into())),
+                ]),
+                tag: 121,
+                any_constructor: None,
+            });
+            let inline_datum = Some(DatumOption::Data(CborWrap(datum_cbor)));
+            let values =
+                queries_v16::TransactionOutput::Current(queries_v16::PostAlonsoTransactionOutput {
+                    address: b"addr_test1vr80076l3x5uw6n94nwhgmv7ssgy6muzf47ugn6z0l92rhg2mgtu0"
+                        .to_vec()
+                        .into(),
+                    amount: Value::Coin(lovelace),
+                    inline_datum,
+                    script_ref: None,
+                });
+
+            let utxo = KeyValuePairs::from(vec![(
+                queries_v16::UTxO {
+                    transaction_id,
+                    index,
+                },
+                values,
+            )]);
+
+            let result = AnyCbor::from_encode(utxo);
+            server.statequery().send_result(result).await.unwrap();
+
+            // server receives query from client
+            let query: Vec<u8> = match server.statequery().recv_while_acquired().await.unwrap() {
+                ClientQueryRequest::Query(q) => q.unwrap(),
+                x => panic!(
+                    "(While expecting `GetUTxOWhole`) \
+                                 Unexpected message from client: {x:?}"
+                ),
+            };
+
+            // CBOR got from preprod node. Mind the stripped `8203`.
+            let cbor_query = Vec::<u8>::from_hex("8200820082068107").unwrap();
+
+            assert_eq!(query, cbor_query);
+            assert_eq!(*server.statequery().state(), localstate::State::Querying);
+
+            let tx_hex = "1610F289E36C9D83C464F85A0AADD59101DDDB0E89592A92809D95D68D79EED9";
+            let txbytes: [u8; 32] = hex::decode(tx_hex).unwrap().try_into().unwrap();
+            let transaction_id_1 = Hash::from(txbytes);
+            let index_1 = AnyUInt::MajorByte(2);
+            let lovelace = AnyUInt::U32(12_419_537);
+            let values_1 = localstate::queries_v16::TransactionOutput::Legacy(
+                localstate::queries_v16::LegacyTransactionOutput {
+                    address: Bytes::from(
+                        hex::decode("60C0359EBB7D0688D79064BD118C99C8B87B5853E3AF59245BB97E84D2")
+                            .unwrap(),
+                    ),
+                    amount: Value::Coin(lovelace),
+                    datum_hash: None,
+                },
+            );
+
+            let tx_hex = "A7BED2F5FCD72BA4CEFDA7C2CC94D119279A17D71BFFC4D90DD4272B93E8A88F";
+            let txbytes: [u8; 32] = hex::decode(tx_hex).unwrap().try_into().unwrap();
+            let transaction_id_2 = Hash::from(txbytes);
+            let index_2 = AnyUInt::MajorByte(0);
+            let lovelace = AnyUInt::U32(1_792_960);
+            let datum_cbor = PlutusData::Constr(Constr {
+                fields: MaybeIndefArray::Indef(vec![
+                    PlutusData::Constr(Constr {
+                        fields: MaybeIndefArray::Indef(vec![PlutusData::BigInt(
+                            queries_v16::BigInt::Int(3764868539i64.into()),
+                        )]),
+                        tag: 121,
+                        any_constructor: None,
+                    }),
+                    PlutusData::BigInt(queries_v16::BigInt::Int(1733882006000i64.into())),
+                ]),
+                tag: 121,
+                any_constructor: None,
+            });
+            let inline_datum = Some(DatumOption::Data(CborWrap(datum_cbor)));
+            let values_2 = localstate::queries_v16::TransactionOutput::Current(
+                localstate::queries_v16::PostAlonsoTransactionOutput {
+                    address: Bytes::from(
+                        hex::decode("603F2728EC78EF8B0F356E91A5662FF3124ADD324A7B7F5AEED69362F4")
+                            .unwrap(),
+                    ),
+                    amount: Value::Coin(lovelace),
+                    inline_datum,
+                    script_ref: None,
+                },
+            );
+
+            let utxos = KeyValuePairs::from(vec![
+                (
+                    localstate::queries_v16::UTxO {
+                        transaction_id: transaction_id_1,
+                        index: index_1,
+                    },
+                    values_1,
+                ),
+                (
+                    localstate::queries_v16::UTxO {
+                        transaction_id: transaction_id_2,
+                        index: index_2,
+                    },
+                    values_2,
+                ),
+            ]);
+
+            let result = AnyCbor::from_encode(utxos);
+            server.statequery().send_result(result).await.unwrap();
+            // server receives query from client
+
+            let query: queries_v16::Request =
+                match server.statequery().recv_while_acquired().await.unwrap() {
+                    ClientQueryRequest::Query(q) => q.into_decode().unwrap(),
+                    x => panic!(
+                        "(While expecting `GetCurrentPParams`) \
+                                 Unexpected message from client: {x:?}"
+                    ),
+                };
+            assert_eq!(
+                query,
+                queries_v16::Request::LedgerQuery(queries_v16::LedgerQuery::BlockQuery(
+                    5,
+                    queries_v16::BlockQuery::GetCurrentPParams,
+                ),)
+            );
+            assert_eq!(*server.statequery().state(), localstate::State::Querying);
+
+            let result = AnyCbor::from_encode(vec![queries_v16::ProtocolParam {
+                minfee_a: Some(44),
+                minfee_b: Some(155381),
+                max_block_body_size: Some(65536),
+                max_transaction_size: Some(16384),
+                max_block_header_size: Some(1100),
+                key_deposit: Some(AnyUInt::U32(2000000)),
+                pool_deposit: Some(AnyUInt::U32(500000000)),
+                maximum_epoch: Some(100000),
+                desired_number_of_stake_pools: Some(500),
+                pool_pledge_influence: Some(UnitInterval {
+                    numerator: 150,
+                    denominator: 100,
+                }),
+                expansion_rate: Some(UnitInterval {
+                    numerator: 3,
+                    denominator: 1000000,
+                }),
+                treasury_growth_rate: Some(UnitInterval {
+                    numerator: 3,
+                    denominator: 1000000,
+                }),
+                protocol_version: Some((10, 0)),
+                min_pool_cost: Some(AnyUInt::U32(340000000)),
+                ada_per_utxo_byte: Some(AnyUInt::U16(44)),
+                cost_models_for_script_languages: None,
+                execution_costs: None,
+                max_tx_ex_units: None,
+                max_block_ex_units: None,
+                max_value_size: None,
+                collateral_percentage: None,
+                max_collateral_inputs: None,
+                pool_voting_thresholds: None,
+                drep_voting_thresholds: None,
+                min_committee_size: None,
+                committee_term_limit: None,
+                governance_action_validity_period: None,
+                governance_action_deposit: None,
+                drep_deposit: None,
+                drep_inactivity_period: None,
+                minfee_refscript_cost_per_byte: None,
+            }]);
+
+            server.statequery().send_result(result).await.unwrap();
+
+            // server receives query from client
+
+            let query: queries_v16::Request =
+                match server.statequery().recv_while_acquired().await.unwrap() {
+                    ClientQueryRequest::Query(q) => q.into_decode().unwrap(),
+                    x => panic!(
+                        "(While expecting `GetStakeSnapshots`) \
+                                 Unexpected message from client: {x:?}"
+                    ),
+                };
+
+            assert_eq!(
+                query,
+                queries_v16::Request::LedgerQuery(queries_v16::LedgerQuery::BlockQuery(
+                    5,
+                    queries_v16::BlockQuery::GetStakeSnapshots(SMaybe::Some(
+                        BTreeSet::new().into()
+                    )),
+                ),)
+            );
+
+            assert_eq!(*server.statequery().state(), localstate::State::Querying);
+
+            let pool_id: Bytes =
+                hex::decode("fdb5834ba06eb4baafd50550d2dc9b3742d2c52cc5ee65bf8673823b")
+                    .unwrap()
+                    .into();
+
+            let stake_snapshots = KeyValuePairs::from(vec![(
+                pool_id,
+                Stakes {
+                    snapshot_mark_pool: 0,
+                    snapshot_set_pool: 0,
+                    snapshot_go_pool: 0,
+                },
+            )]);
+
+            let snapshots = StakeSnapshots {
+                stake_snapshots,
+                snapshot_stake_mark_total: 0,
+                snapshot_stake_set_total: 0,
+                snapshot_stake_go_total: 0,
+            };
+
+            let result = AnyCbor::from_encode(snapshots);
+            server.statequery().send_result(result).await.unwrap();
+
+            // server receives query from client
+            let query: queries_v16::Request =
+                match server.statequery().recv_while_acquired().await.unwrap() {
+                    ClientQueryRequest::Query(q) => q.into_decode().unwrap(),
+                    x => panic!(
+                        "(While expecting `GetGenesisConfig`) \
+                                 Unexpected message from client: {x:?}"
+                    ),
+                };
+
+            assert_eq!(
+                query,
+                queries_v16::Request::LedgerQuery(queries_v16::LedgerQuery::BlockQuery(
+                    5,
+                    queries_v16::BlockQuery::GetGenesisConfig,
+                ),)
+            );
+
+            assert_eq!(*server.statequery().state(), localstate::State::Querying);
+
+            let genesis = vec![GenesisConfig {
+                system_start: SystemStart {
+                    year: 2021.into(),
+                    day_of_year: 150,
+                    picoseconds_of_day: 0.into(),
+                },
+                network_magic: 42,
+                network_id: 42,
+                active_slots_coefficient: Fraction { num: 6, den: 10 },
+                security_param: 2160,
+                epoch_length: 432000,
+                slots_per_kes_period: 129600,
+                max_kes_evolutions: 62,
+                slot_length: 1,
+                update_quorum: 5,
+                max_lovelace_supply: AnyUInt::MajorByte(2),
+            }];
+
+            let result = AnyCbor::from_encode(genesis);
+            server.statequery().send_result(result).await.unwrap();
+
+            assert_eq!(*server.statequery().state(), localstate::State::Acquired);
+
+            // server receives re-acquire from the client
+
+            let maybe_point = match server.statequery().recv_while_acquired().await.unwrap() {
+                ClientQueryRequest::ReAcquire(p) => p,
+                x => panic!(
+                    "(While expecting `ReAcquire`) \
+                             Unexpected message from client: {x:?}"
+                ),
+            };
+
+            assert_eq!(maybe_point, Some(Point::Specific(1337, vec![1, 2, 3])));
+            assert_eq!(*server.statequery().state(), localstate::State::Acquiring);
+
+            server.statequery().send_acquired().await.unwrap();
+
+            // server receives query from client
+            let query: Vec<u8> = match server.statequery().recv_while_acquired().await.unwrap() {
+                ClientQueryRequest::Query(q) => q.unwrap(),
+                x => panic!(
+                    "(While expecting `GetFilteredDeleg...`) \
+                                 Unexpected message from client: {x:?}"
+                ),
+            };
+
+            let addr: Addr =
+                <[u8; 28]>::from_hex("1218F563E4E10958FDABBDFB470B2F9D386215763CC89273D9BDFFFA")
+                    .unwrap()
+                    .to_vec()
+                    .into();
+            // CBOR got from preprod node. Mind the stripped `8203`.
+            let cbor_query = Vec::<u8>::from_hex(
+                "820082008206820a818200581c1218f563e4e10958fdabbdfb470b2f9d386215763cc89273d9bdfffa"
+            ).unwrap();
+
+            assert_eq!(query, cbor_query);
+            assert_eq!(*server.statequery().state(), localstate::State::Querying);
+
+            let pool_addr: Addr =
+                <[u8; 28]>::from_hex("1E3105F23F2AC91B3FB4C35FA4FE301421028E356E114944E902005B")
+                    .unwrap()
+                    .to_vec()
+                    .into();
+
+            let delegs = KeyValuePairs::from(vec![(StakeAddr::from((0, addr.clone())), pool_addr)]);
+            let rewards = KeyValuePairs::from(vec![(StakeAddr::from((0, addr)), 250526523)]);
+            let delegs_rewards = queries_v16::FilteredDelegsRewards { delegs, rewards };
+
+            let result = AnyCbor::from_encode(delegs_rewards);
+            server.statequery().send_result(result).await.unwrap();
+
+            // server receives release from the client
+
+            match server.statequery().recv_while_acquired().await.unwrap() {
+                ClientQueryRequest::Release => (),
+                x => panic!("unexpected message from client: {x:?}"),
+            };
+
+            let next_request = server.statequery().recv_while_idle().await.unwrap();
+
+            assert!(next_request.is_none());
+            assert_eq!(*server.statequery().state(), localstate::State::Done);
+        }
+    });
+
+    let client = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // client setup
+        let socket_path = "node1.socket";
+
+        let mut client = NodeClient::connect(socket_path, 0).await.unwrap();
+
+        // client sends acquire
+
+        client
+            .statequery()
+            .send_acquire(Some(Point::Origin))
+            .await
+            .unwrap();
+
+        client.statequery().recv_while_acquiring().await.unwrap();
+
+        assert_eq!(*client.statequery().state(), localstate::State::Acquired);
+
+        // client sends a BlockQuery
+
+        let request = AnyCbor::from_encode(queries_v16::Request::GetSystemStart);
+
+        client.statequery().send_query(request).await.unwrap();
+
+        let result: SystemStart = client
+            .statequery()
+            .recv_while_querying()
+            .await
+            .unwrap()
+            .into_decode()
+            .unwrap();
+
+        assert_eq!(
+            result,
+            queries_v16::SystemStart {
+                year: 2020.into(),
+                day_of_year: 1,
+                picoseconds_of_day: 999999999.into(),
+            }
+        );
+
+        let request = AnyCbor::from_encode(queries_v16::Request::GetChainBlockNo);
+        client.statequery().send_query(request).await.unwrap();
+
+        let result: ChainBlockNumber = client
+            .statequery()
+            .recv_while_querying()
+            .await
+            .unwrap()
+            .into_decode()
+            .unwrap();
+
+        assert_eq!(
+            result,
+            queries_v16::ChainBlockNumber {
+                slot_timeline: 1, // current
+                block_number: 2143789,
+            }
+        );
+
+        let request = AnyCbor::from_encode(queries_v16::Request::LedgerQuery(
+            queries_v16::LedgerQuery::BlockQuery(5, queries_v16::BlockQuery::GetStakeDistribution),
+        ));
+
+        client.statequery().send_query(request).await.unwrap();
+
+        let result: queries_v16::StakeDistribution = client
+            .statequery()
+            .recv_while_querying()
+            .await
+            .unwrap()
+            .into_decode()
+            .unwrap();
+
+        let rational = RationalNumber {
+            numerator: 10,
+            denominator: 20,
+        };
+        let pool = localstate::queries_v16::Pool {
+            stakes: rational.clone(),
+            hashes: b"pool1qv4qgv62s3ha74p0643nexee9zvcdydcyahqqnavhj90zheuykz"
+                .to_vec()
+                .into(),
+        };
+
+        let pools = vec![(
+            b"pool1qvfw4r3auysa5mhpr90n7mmdhs55js8gdywh0y2e3sy6568j2wp"
+                .to_vec()
+                .into(),
+            pool,
+        )];
+
+        assert_eq!(result, KeyValuePairs::from(pools));
+
+        let addr_hex = "981D186018CE18F718FB185F188918A918C7186A186518AC18DD1874186D189E188410184D186F1882184D187D18C4184F1842187F18CA18A118DD";
+        let addr = hex::decode(addr_hex).unwrap();
+        let addr: Addr = addr.to_vec().into();
+        let addrs: Addrs = Vec::from([addr]);
+
+        let request = AnyCbor::from_encode(queries_v16::Request::LedgerQuery(
+            queries_v16::LedgerQuery::BlockQuery(
+                5,
+                queries_v16::BlockQuery::GetUTxOByAddress(addrs),
+            ),
+        ));
+
+        client.statequery().send_query(request).await.unwrap();
+
+        let result: queries_v16::UTxOByAddress = client
+            .statequery()
+            .recv_while_querying()
+            .await
+            .unwrap()
+            .into_decode()
+            .unwrap();
+
+        let tx_hex = "1e4e5cf2889d52f1745b941090f04a65dea6ce56c5e5e66e69f65c8e36347c17";
+        let txbytes: [u8; 32] = hex::decode(tx_hex).unwrap().try_into().unwrap();
+        let transaction_id = Hash::from(txbytes);
+        let index = AnyUInt::MajorByte(2);
+        let lovelace = AnyUInt::MajorByte(2);
+        let datum_cbor = PlutusData::Constr(Constr {
+            fields: MaybeIndefArray::Indef(vec![
+                PlutusData::Constr(Constr {
+                    fields: MaybeIndefArray::Indef(vec![PlutusData::BigInt(
+                        queries_v16::BigInt::Int(3764868539i64.into()),
+                    )]),
+                    tag: 121,
+                    any_constructor: None,
+                }),
+                PlutusData::BigInt(queries_v16::BigInt::Int(1733882006000i64.into())),
+            ]),
+            tag: 121,
+            any_constructor: None,
+        });
+        let inline_datum = Some(DatumOption::Data(CborWrap(datum_cbor)));
+        let values =
+            queries_v16::TransactionOutput::Current(queries_v16::PostAlonsoTransactionOutput {
+                address: b"addr_test1vr80076l3x5uw6n94nwhgmv7ssgy6muzf47ugn6z0l92rhg2mgtu0"
+                    .to_vec()
+                    .into(),
+                amount: Value::Coin(lovelace),
+                inline_datum,
+                script_ref: None,
+            });
+
+        let utxo = KeyValuePairs::from(vec![(
+            queries_v16::UTxO {
+                transaction_id,
+                index,
+            },
+            values,
+        )]);
+
+        assert_eq!(result, utxo);
+        let request = AnyCbor::from_encode(localstate::queries_v16::Request::LedgerQuery(
+            localstate::queries_v16::LedgerQuery::BlockQuery(
+                6,
+                localstate::queries_v16::BlockQuery::GetUTxOWhole,
+            ),
+        ));
+        client.statequery().send_query(request).await.unwrap();
+
+        let result: Vec<u8> = client
+            .statequery()
+            .recv_while_querying()
+            .await
+            .unwrap()
+            .unwrap();
+
+        let utxo = Vec::<u8>::from_hex(
+            "A28258201610F289E36C9D83C464F85A0AADD59101DDDB0E89592A92809D95D6\
+             8D79EED90282581D60C0359EBB7D0688D79064BD118C99C8B87B5853E3AF59245B\
+             B97E84D21A00BD81D1825820A7BED2F5FCD72BA4CEFDA7C2CC94D119279A17D71B\
+             FFC4D90DD4272B93E8A88F00A300581D603F2728EC78EF8B0F356E91A5662FF312\
+             4ADD324A7B7F5AEED69362F4011A001B5BC0028201D81856D8799FD8799F1AE067\
+             55BBFF1B00000193B36BC9F0FF",
+        )
+        .unwrap();
+
+        assert_eq!(result, utxo);
+        let request = AnyCbor::from_encode(queries_v16::Request::LedgerQuery(
+            queries_v16::LedgerQuery::BlockQuery(5, queries_v16::BlockQuery::GetCurrentPParams),
+        ));
+
+        client.statequery().send_query(request).await.unwrap();
+
+        let result: Vec<queries_v16::ProtocolParam> = client
+            .statequery()
+            .recv_while_querying()
+            .await
+            .unwrap()
+            .into_decode()
+            .unwrap();
+
+        assert_eq!(
+            result,
+            vec![queries_v16::ProtocolParam {
+                minfee_a: Some(44),
+                minfee_b: Some(155381),
+                max_block_body_size: Some(65536),
+                max_transaction_size: Some(16384),
+                max_block_header_size: Some(1100),
+                key_deposit: Some(AnyUInt::U32(2000000)),
+                pool_deposit: Some(AnyUInt::U32(500000000)),
+                maximum_epoch: Some(100000),
+                desired_number_of_stake_pools: Some(500),
+                pool_pledge_influence: Some(UnitInterval {
+                    numerator: 150,
+                    denominator: 100,
+                }),
+                expansion_rate: Some(UnitInterval {
+                    numerator: 3,
+                    denominator: 1000000,
+                }),
+                treasury_growth_rate: Some(UnitInterval {
+                    numerator: 3,
+                    denominator: 1000000,
+                }),
+                protocol_version: Some((10, 0)),
+                min_pool_cost: Some(AnyUInt::U32(340000000)),
+                ada_per_utxo_byte: Some(AnyUInt::U16(44)),
+                cost_models_for_script_languages: None,
+                execution_costs: None,
+                max_tx_ex_units: None,
+                max_block_ex_units: None,
+                max_value_size: None,
+                collateral_percentage: None,
+                max_collateral_inputs: None,
+                pool_voting_thresholds: None,
+                drep_voting_thresholds: None,
+                min_committee_size: None,
+                committee_term_limit: None,
+                governance_action_validity_period: None,
+                governance_action_deposit: None,
+                drep_deposit: None,
+                drep_inactivity_period: None,
+                minfee_refscript_cost_per_byte: None
+            }]
+        );
+
+        let request = AnyCbor::from_encode(queries_v16::Request::LedgerQuery(
+            queries_v16::LedgerQuery::BlockQuery(
+                5,
+                queries_v16::BlockQuery::GetStakeSnapshots(SMaybe::Some(BTreeSet::new().into())),
+            ),
+        ));
+
+        client.statequery().send_query(request).await.unwrap();
+
+        let result: queries_v16::StakeSnapshots = client
+            .statequery()
+            .recv_while_querying()
+            .await
+            .unwrap()
+            .into_decode()
+            .unwrap();
+
+        let pool_id: Bytes =
+            hex::decode("fdb5834ba06eb4baafd50550d2dc9b3742d2c52cc5ee65bf8673823b")
+                .unwrap()
+                .into();
+
+        let stake_snapshots = KeyValuePairs::from(vec![(
+            pool_id,
+            Stakes {
+                snapshot_mark_pool: 0,
+                snapshot_set_pool: 0,
+                snapshot_go_pool: 0,
+            },
+        )]);
+
+        let snapshots = StakeSnapshots {
+            stake_snapshots,
+            snapshot_stake_mark_total: 0,
+            snapshot_stake_set_total: 0,
+            snapshot_stake_go_total: 0,
+        };
+
+        assert_eq!(result, snapshots);
+
+        let request = AnyCbor::from_encode(queries_v16::Request::LedgerQuery(
+            queries_v16::LedgerQuery::BlockQuery(5, queries_v16::BlockQuery::GetGenesisConfig),
+        ));
+
+        client.statequery().send_query(request).await.unwrap();
+
+        let result: Vec<GenesisConfig> = client
+            .statequery()
+            .recv_while_querying()
+            .await
+            .unwrap()
+            .into_decode()
+            .unwrap();
+
+        let genesis = vec![GenesisConfig {
+            system_start: SystemStart {
+                year: 2021.into(),
+                day_of_year: 150,
+                picoseconds_of_day: 0.into(),
+            },
+            network_magic: 42,
+            network_id: 42,
+            active_slots_coefficient: Fraction { num: 6, den: 10 },
+            security_param: 2160,
+            epoch_length: 432000,
+            slots_per_kes_period: 129600,
+            max_kes_evolutions: 62,
+            slot_length: 1,
+            update_quorum: 5,
+            max_lovelace_supply: AnyUInt::MajorByte(2),
+        }];
+
+        assert_eq!(result, genesis);
+
+        // client sends a ReAquire
+        client
+            .statequery()
+            .send_reacquire(Some(Point::Specific(1337, vec![1, 2, 3])))
+            .await
+            .unwrap();
+
+        client.statequery().recv_while_acquiring().await.unwrap();
+
+        let addr: Addr =
+            <[u8; 28]>::from_hex("1218F563E4E10958FDABBDFB470B2F9D386215763CC89273D9BDFFFA")
+                .unwrap()
+                .to_vec()
+                .into();
+        let mut addrs = BTreeSet::new();
+        addrs.insert(StakeAddr::from((0x00, addr.clone())));
+
+        let request = AnyCbor::from_encode(queries_v16::Request::LedgerQuery(
+            queries_v16::LedgerQuery::BlockQuery(
+                6,
+                queries_v16::BlockQuery::GetFilteredDelegationsAndRewardAccounts(addrs),
+            ),
+        ));
+        client.statequery().send_query(request).await.unwrap();
+
+        let result: Vec<u8> = client
+            .statequery()
+            .recv_while_querying()
+            .await
+            .unwrap()
+            .unwrap();
+
+        let delegs_rewards_cbor = Vec::<u8>::from_hex(
+            "82a18200581c1218f563e4e10958fdabbdfb470b2f9d386215763cc89273d9bd\
+             fffa581c1e3105f23f2ac91b3fb4c35fa4fe301421028e356e114944e902005ba1\
+             8200581c1218f563e4e10958fdabbdfb470b2f9d386215763cc89273d9bdfffa1a\
+             0eeebb3b",
+        )
+        .unwrap();
+
+        assert_eq!(result, delegs_rewards_cbor);
+
+        client.statequery().send_release().await.unwrap();
+
+        client.statequery().send_done().await.unwrap();
+    });
+
+    tokio::try_join!(client, server).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+pub async fn local_state_query_server_and_client_happy_path2() {
+    let server = tokio::spawn({
+        async move {
+            // server setup
+            let socket_path = Path::new("node2.socket");
+
+            if socket_path.exists() {
+                fs::remove_file(socket_path).unwrap();
+            }
+
+            let listener = UnixListener::bind(socket_path).unwrap();
+
+            let mut server = pallas_network::facades::NodeServer::accept(&listener, 0)
+                .await
+                .unwrap();
+
+            // wait for acquire request from client
+
+            let maybe_acquire = server.statequery().recv_while_idle().await.unwrap();
+
+            assert!(maybe_acquire.is_some());
+            assert_eq!(*server.statequery().state(), localstate::State::Acquiring);
+
+            server.statequery().send_acquired().await.unwrap();
+
+            assert_eq!(*server.statequery().state(), localstate::State::Acquired);
+
+            // server receives query from client
+
+            let query: Vec<u8> = match server.statequery().recv_while_acquired().await.unwrap() {
+                ClientQueryRequest::Query(q) => q.unwrap(),
+                x => panic!(
+                    "While expecting `GetStakePoolParams`) \
+                                 Unexpected message from client: {x:?}"
+                ),
+            };
+
+            // CBOR got from preprod node. Mind the stripped `82038200`.
+            let cbor_query = Vec::<u8>::from_hex(
+                "820082068211d9010281581cfdb5834ba06eb4baafd50550d2dc9b3742d2c52cc5ee65bf8673823b",
+            )
+            .unwrap();
+
+            assert_eq!(query, cbor_query);
+
+            assert_eq!(*server.statequery().state(), localstate::State::Querying);
+
+            let pool_id: Bytes =
+                Vec::<u8>::from_hex("fdb5834ba06eb4baafd50550d2dc9b3742d2c52cc5ee65bf8673823b")
+                    .unwrap()
+                    .into();
+            let operator = pool_id.clone();
+            let vrf_keyhash = Vec::<u8>::from_hex(
+                "2A6A3D82278A554E9C1777C427BF0397FAF5CD7734900752D698E57679CC523F",
+            )
+            .unwrap()
+            .into();
+            let reward_account =
+                Vec::<u8>::from_hex("E01AEF81CBAB75DB2DE0FE3885332EBE67C34EB1ADBF43BB2408BA3981")
+                    .unwrap()
+                    .into();
+            let pool_metadata: Nullable<PoolMetadata> = Some(PoolMetadata {
+                url: "https://csouza.me/jp-pp.json".to_string(),
+                hash: Vec::from_hex(
+                    "C9623111188D0BF90E8305E40AA91A040D8036C7813A4ECA44E06FA0A1A893A6",
+                )
+                .unwrap()
+                .into(),
+            })
+            .into();
+            let pool_params = PoolParams {
+                operator,
+                vrf_keyhash,
+                pledge: AnyUInt::U64(5_000_000_000),
+                cost: AnyUInt::U32(340_000_000),
+                margin: localstate::queries_v16::RationalNumber {
+                    numerator: 3,
+                    denominator: 40,
+                },
+                reward_account,
+                pool_owners: BTreeSet::from([Bytes::from(
+                    Vec::<u8>::from_hex("1AEF81CBAB75DB2DE0FE3885332EBE67C34EB1ADBF43BB2408BA3981")
+                        .unwrap(),
+                )])
+                .into(),
+                relays: vec![Relay::SingleHostName(
+                    Some(3001).into(),
+                    "preprod.junglestakepool.com".to_string(),
+                )],
+                pool_metadata,
+            };
+            // The map is inside a (singleton) array
+            let result = AnyCbor::from_encode([BTreeMap::from([(pool_id, pool_params)])]);
+
+            server.statequery().send_result(result).await.unwrap();
+
+            assert_eq!(*server.statequery().state(), localstate::State::Acquired);
+
+            match server.statequery().recv_while_acquired().await.unwrap() {
+                ClientQueryRequest::Release => (),
+                x => panic!("unexpected message from client: {x:?}"),
+            };
+
+            let next_request = server.statequery().recv_while_idle().await.unwrap();
+
+            assert!(next_request.is_none());
+            assert_eq!(*server.statequery().state(), localstate::State::Done);
+        }
+    });
+
+    let client = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // client setup
+        let socket_path = "node2.socket";
+
+        let mut client = NodeClient::connect(socket_path, 0).await.unwrap();
+
+        // client sends acquire
+
+        client
+            .statequery()
+            .send_acquire(Some(Point::Origin))
+            .await
+            .unwrap();
+
+        client.statequery().recv_while_acquiring().await.unwrap();
+
+        assert_eq!(*client.statequery().state(), localstate::State::Acquired);
+
+        // client sends a BlockQuery
+
+        let pool_id1 = "fdb5834ba06eb4baafd50550d2dc9b3742d2c52cc5ee65bf8673823b";
+        let pool_id1: Bytes = Vec::<u8>::from_hex(pool_id1).unwrap().into();
+        let mut pools = BTreeSet::<Bytes>::new();
+        pools.insert(pool_id1);
+
+        let request = AnyCbor::from_encode(localstate::queries_v16::LedgerQuery::BlockQuery(
+            6,
+            localstate::queries_v16::BlockQuery::GetStakePoolParams(pools.into()),
+        ));
+
+        client.statequery().send_query(request).await.unwrap();
+
+        let result: Vec<u8> = client
+            .statequery()
+            .recv_while_querying()
+            .await
+            .unwrap()
+            .unwrap();
+        // CBOR got from preprod node.
+        let pool_params_cbor = Vec::<u8>::from_hex(
+            "81a1581cfdb5834ba06eb4baafd50550d2dc9b3742d2c52cc5ee65bf8673823b8958\
+             1cfdb5834ba06eb4baafd50550d2dc9b3742d2c52cc5ee65bf8673823b58202a6a3d\
+             82278a554e9c1777c427bf0397faf5cd7734900752d698e57679cc523f1b00000001\
+             2a05f2001a1443fd00d81e82031828581de01aef81cbab75db2de0fe3885332ebe67\
+             c34eb1adbf43bb2408ba3981d9010281581c1aef81cbab75db2de0fe3885332ebe67\
+             c34eb1adbf43bb2408ba3981818301190bb9781b70726570726f642e6a756e676c65\
+             7374616b65706f6f6c2e636f6d82781c68747470733a2f2f63736f757a612e6d652f\
+             6a702d70702e6a736f6e5820c9623111188d0bf90e8305e40aa91a040d8036c7813a\
+             4eca44e06fa0a1a893a6",
+        )
+        .unwrap();
+
+        assert_eq!(result, pool_params_cbor);
+
+        client.statequery().send_release().await.unwrap();
+
+        client.statequery().send_done().await.unwrap();
+    });
+
+    tokio::try_join!(client, server).unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+pub async fn txsubmission_server_and_client_happy_path_n2n() {
+    let test_txs = vec![(vec![0], vec![0, 0, 0]), (vec![1], vec![1, 1, 1])];
+
+    let server_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30001))
+        .await
+        .unwrap();
+
+    let server = tokio::spawn({
+        let test_txs = test_txs.clone();
+        async move {
+            let mut peer_server = PeerServer::accept(&server_listener, 0).await.unwrap();
+
+            let server_txsub = peer_server.txsubmission();
+
+            // server waits for init
+
+            server_txsub.wait_for_init().await.unwrap();
+
+            // server requests some tx ids
+
+            server_txsub
+                .acknowledge_and_request_tx_ids(false, 0, 2)
+                .await
+                .unwrap();
+
+            assert_eq!(*server_txsub.state(), txsubmission::State::TxIdsNonBlocking);
+
+            // server receives tx ids
+
+            let txids = match server_txsub.receive_next_reply().await.unwrap() {
+                txsubmission::Reply::TxIds(x) => x,
+                _ => panic!("unexpected message"),
+            };
+
+            assert_eq!(*server_txsub.state(), txsubmission::State::Idle);
+
+            // server requests txs for ids
+
+            let txids: Vec<_> = txids.into_iter().map(|t| t.0).collect();
+
+            assert_eq!(txids[0].1, test_txs[0].0);
+            assert_eq!(txids[1].1, test_txs[1].0);
+
+            server_txsub.request_txs(txids).await.unwrap();
+
+            assert_eq!(*server_txsub.state(), txsubmission::State::Txs);
+
+            // server receives txs
+
+            let txs = match server_txsub.receive_next_reply().await.unwrap() {
+                txsubmission::Reply::Txs(x) => x,
+                _ => panic!("unexpected message"),
+            };
+
+            assert_eq!(*server_txsub.state(), txsubmission::State::Idle);
+
+            assert_eq!(txs[0].1, test_txs[0].1);
+            assert_eq!(txs[1].1, test_txs[1].1);
+
+            // server requests more tx ids (blocking)
+
+            server_txsub
+                .acknowledge_and_request_tx_ids(true, 2, 1)
+                .await
+                .unwrap();
+
+            assert_eq!(*server_txsub.state(), txsubmission::State::TxIdsBlocking);
+
+            // server receives done from client
+
+            match server_txsub.receive_next_reply().await.unwrap() {
+                txsubmission::Reply::Done => (),
+                _ => panic!("unexpected message"),
+            }
+
+            assert_eq!(*server_txsub.state(), txsubmission::State::Done);
+        }
+    });
+
+    let client = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let mut mempool = test_txs.clone();
+
+        // client setup
+        let mut client_to_server_conn = PeerClient::connect("localhost:30001", 0).await.unwrap();
+
+        let client_txsub = client_to_server_conn.txsubmission();
+
+        // send init
+
+        client_txsub.send_init().await.unwrap();
+
+        assert_eq!(*client_txsub.state(), txsubmission::State::Idle);
+
+        // receive ids request from server
+
+        let (_, req) = match client_txsub.next_request().await.unwrap() {
+            txsubmission::Request::TxIdsNonBlocking(ack, req) => (ack, req),
+            _ => panic!("unexpected message"),
+        };
+
+        assert_eq!(*client_txsub.state(), txsubmission::State::TxIdsNonBlocking);
+
+        // send ids to server
+
+        let to_send = mempool.drain(..req as usize).collect::<Vec<_>>();
+
+        let ids_and_size = to_send
+            .clone()
+            .into_iter()
+            .map(|(h, b)| TxIdAndSize(txsubmission::EraTxId(0, h), b.len() as u32))
+            .collect();
+
+        client_txsub.reply_tx_ids(ids_and_size).await.unwrap();
+
+        assert_eq!(*client_txsub.state(), txsubmission::State::Idle);
+
+        // receive txs request from server
+
+        let ids = match client_txsub.next_request().await.unwrap() {
+            txsubmission::Request::Txs(ids) => ids,
+            _ => panic!("unexpected message"),
+        };
+
+        assert_eq!(*client_txsub.state(), txsubmission::State::Txs);
+
+        assert_eq!(ids[0].1, test_txs[0].0);
+        assert_eq!(ids[1].1, test_txs[1].0);
+
+        // send txs to server
+
+        let txs_to_send: Vec<_> = to_send.into_iter().map(|(_, b)| EraTxBody(0, b)).collect();
+
+        client_txsub.reply_txs(txs_to_send).await.unwrap();
+
+        assert_eq!(*client_txsub.state(), txsubmission::State::Idle);
+
+        // receive tx ids request from server (blocking)
+
+        match client_txsub.next_request().await.unwrap() {
+            txsubmission::Request::TxIds(_, _) => (),
+            _ => panic!("unexpected message"),
+        };
+
+        assert_eq!(*client_txsub.state(), txsubmission::State::TxIdsBlocking);
+
+        // send done to server
+
+        client_txsub.send_done().await.unwrap();
+
+        assert_eq!(*client_txsub.state(), txsubmission::State::Done);
+    });
+
+    tokio::try_join!(client, server).unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+pub async fn txsubmission_submit_to_mainnet_peer_n2n() {
+    let tx_hash =
+        hex::decode("8b6e50e09376b5021e93fe688ba9e7100e3682cebcb39970af5f4e5962bc5a3d").unwrap();
+    let tx_hex = include_str!("../../test_data/babbage11.tx");
+    let tx_bytes = hex::decode(tx_hex).unwrap();
+
+    let mempool = vec![(tx_hash, tx_bytes)];
+
+    // client setup
+    let mut client_to_server_conn =
+        PeerClient::connect("relays-new.cardano-mainnet.iohk.io:3001", MAINNET_MAGIC)
+            .await
+            .unwrap();
+
+    let client_txsub = client_to_server_conn.txsubmission();
+
+    // send init
+
+    client_txsub.send_init().await.unwrap();
+
+    assert_eq!(*client_txsub.state(), txsubmission::State::Idle);
+
+    // receive ids request from server
+
+    let ack = match client_txsub.next_request().await.unwrap() {
+        txsubmission::Request::TxIds(ack, _) => {
+            assert_eq!(*client_txsub.state(), txsubmission::State::TxIdsBlocking);
+            ack
+        }
+        txsubmission::Request::TxIdsNonBlocking(ack, _) => {
+            assert_eq!(*client_txsub.state(), txsubmission::State::TxIdsNonBlocking);
+            ack
+        }
+        _ => panic!("unexpected message"),
+    };
+
+    assert_eq!(ack, 0);
+
+    // send ids to server
+
+    let to_send = mempool.clone();
+
+    let ids_and_size = to_send
+        .clone()
+        .into_iter()
+        .map(|(h, b)| TxIdAndSize(txsubmission::EraTxId(4, h), b.len() as u32))
+        .collect();
+
+    client_txsub.reply_tx_ids(ids_and_size).await.unwrap();
+
+    assert_eq!(*client_txsub.state(), txsubmission::State::Idle);
+
+    // receive txs request from server
+
+    let ids = match client_txsub.next_request().await.unwrap() {
+        txsubmission::Request::Txs(ids) => ids,
+        _ => panic!("unexpected message"),
+    };
+
+    assert_eq!(*client_txsub.state(), txsubmission::State::Txs);
+
+    assert_eq!(ids[0].1, mempool[0].0);
+
+    // send txs to server
+
+    let txs_to_send: Vec<_> = to_send.into_iter().map(|(_, b)| EraTxBody(4, b)).collect();
+
+    client_txsub.reply_txs(txs_to_send).await.unwrap();
+
+    assert_eq!(*client_txsub.state(), txsubmission::State::Idle);
+
+    // receive tx ids request from server (blocking)
+
+    // server usually sends another request before processing/acknowledging our
+    // previous response, so ack is 0. the ack comes in the next message.
+    match client_txsub.next_request().await.unwrap() {
+        txsubmission::Request::TxIdsNonBlocking(_, _) => {
+            assert_eq!(*client_txsub.state(), txsubmission::State::TxIdsNonBlocking);
+        }
+        _ => panic!("unexpected message"),
+    };
+
+    client_txsub.reply_tx_ids(vec![]).await.unwrap();
+
+    let ack = match client_txsub.next_request().await.unwrap() {
+        txsubmission::Request::TxIds(ack, _) => {
+            assert_eq!(*client_txsub.state(), txsubmission::State::TxIdsBlocking);
+
+            client_txsub.send_done().await.unwrap();
+            assert_eq!(*client_txsub.state(), txsubmission::State::Done);
+
+            ack
+        }
+        txsubmission::Request::TxIdsNonBlocking(ack, _) => {
+            assert_eq!(*client_txsub.state(), txsubmission::State::TxIdsNonBlocking);
+
+            ack
+        }
+        _ => panic!("unexpected message"),
+    };
+
+    // server should acknowledge the one transaction we sent now
+    assert_eq!(ack, 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+pub async fn peer_sharing_server_and_client_happy_path() {
+    use tracing::info;
+
+    tracing_subscriber::fmt::init();
+
+    let amount = 3;
+
+    let peer_addresses = vec![
+        PeerAddress::V4(Ipv4Addr::new(127, 0, 0, 1), 3000),
+        PeerAddress::V4(Ipv4Addr::new(192, 0, 2, 146), 3001),
+        PeerAddress::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc00a, 0x2ff), 8000),
+    ];
+
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 30003))
+        .await
+        .unwrap();
+
+    let server = tokio::spawn({
+        let addresses = peer_addresses.clone();
+        async move {
+            // server setup
+
+            let mut peer_server = PeerServer::accept(&listener, 0).await.unwrap();
+
+            let server_ps = peer_server.peersharing();
+
+            // server receives share request from client
+
+            info!("server waiting for share request");
+            let amount_request = server_ps.recv_share_request().await.unwrap().unwrap();
+
+            assert_eq!(amount_request, amount);
+            assert_eq!(*server_ps.state(), peersharing::State::Busy(amount));
+
+            // Server sends peer addresses
+
+            server_ps.send_peer_addresses(addresses).await.unwrap();
+
+            assert_eq!(*server_ps.state(), peersharing::State::Idle);
+
+            // Server receives Done message from client
+
+            assert_eq!(server_ps.recv_share_request().await.unwrap(), None);
+
+            assert_eq!(*server_ps.state(), peersharing::State::Done);
+        }
+    });
+
+    let client = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // client setup
+
+        let mut client_to_server_conn = PeerClient::connect("localhost:30003", 0).await.unwrap();
+
+        let client_ps = client_to_server_conn.peersharing();
+
+        // client sends peers request, receives peer addresses
+
+        client_ps.send_share_request(amount).await.unwrap();
+
+        assert_eq!(
+            client_ps.recv_peer_addresses().await.unwrap(),
+            peer_addresses
+        );
+
+        // client sends Done
+
+        client_ps.send_done().await.unwrap();
+
+        assert!(client_ps.is_done())
+    });
+
+    tokio::try_join!(client, server).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+pub async fn local_message_notification_server_and_client_happy_path() {
+    fn fake_msgs() -> Vec<DmqMsg> {
+        use pallas_network::miniprotocols::localmsgsubmission::{
+            DmqMsgOperationalCertificate, DmqMsgPayload,
+        };
+
+        vec![
+            DmqMsg {
+                msg_id: vec![1, 2, 3],
+                msg_payload: DmqMsgPayload {
+                    msg_body: vec![0, 1, 2],
+                    kes_period: 10,
+                    expires_at: 100,
+                },
+                kes_signature: vec![0, 1, 2, 3],
+                operational_certificate: DmqMsgOperationalCertificate {
+                    kes_vk: vec![1, 2, 3],
+                    issue_number: 4,
+                    start_kes_period: 5,
+                    cert_sig: vec![6],
+                },
+                cold_verification_key: vec![0, 1, 2, 3, 4, 5],
+            },
+            DmqMsg {
+                msg_id: vec![1, 2, 3],
+                msg_payload: DmqMsgPayload {
+                    msg_body: vec![1, 2, 3],
+                    kes_period: 12,
+                    expires_at: 102,
+                },
+                kes_signature: vec![1, 2, 3, 4],
+                operational_certificate: DmqMsgOperationalCertificate {
+                    kes_vk: vec![1, 2, 3],
+                    issue_number: 4,
+                    start_kes_period: 5,
+                    cert_sig: vec![6],
+                },
+                cold_verification_key: vec![1, 2, 3, 4, 5, 6],
+            },
+        ]
+    }
+
+    let server = tokio::spawn({
+        async move {
+            // server setup
+            let socket_path = Path::new("node3.socket");
+            if socket_path.exists() {
+                fs::remove_file(socket_path).unwrap();
+            }
+            let listener = UnixListener::bind(socket_path).unwrap();
+            let mut server = pallas_network::facades::DmqServer::accept(&listener, 0)
+                .await
+                .unwrap();
+
+            // init local msg notification server
+            let server_msg = server.msg_notification();
+            assert_eq!(*server_msg.state(), localmsgnotification::State::Idle);
+
+            // server waits for non blocking request from client and replies to it
+            let request = server_msg.recv_next_request().await.unwrap();
+            assert_eq!(request, localmsgnotification::Request::NonBlocking);
+            assert_eq!(
+                *server_msg.state(),
+                localmsgnotification::State::BusyNonBlocking
+            );
+
+            server_msg
+                .send_reply_messages_non_blocking(fake_msgs(), true)
+                .await
+                .unwrap();
+            assert_eq!(*server_msg.state(), localmsgnotification::State::Idle);
+
+            // server waits for blocking request from client and replies to it
+            let request = server_msg.recv_next_request().await.unwrap();
+            assert_eq!(request, localmsgnotification::Request::Blocking);
+            assert_eq!(
+                *server_msg.state(),
+                localmsgnotification::State::BusyBlocking
+            );
+
+            server_msg
+                .send_reply_messages_blocking(fake_msgs())
+                .await
+                .unwrap();
+            assert_eq!(*server_msg.state(), localmsgnotification::State::Idle);
+
+            // server receives done from client
+            server_msg.recv_done().await.unwrap();
+            assert_eq!(*server_msg.state(), localmsgnotification::State::Done);
+        }
+    });
+
+    let client = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // client setup
+        let socket_path = "node3.socket";
+        let mut client = DmqClient::connect(socket_path, 0).await.unwrap();
+
+        // init local msg notification client
+        let client_msg = client.msg_notification();
+        assert_eq!(*client_msg.state(), localmsgnotification::State::Idle);
+
+        // client sends a non blocking request to server and waits for a reply from the server
+        client_msg
+            .send_request_messages_non_blocking()
+            .await
+            .unwrap();
+        assert_eq!(
+            *client_msg.state(),
+            localmsgnotification::State::BusyNonBlocking
+        );
+
+        let reply = client_msg.recv_next_reply().await.unwrap();
+        assert_eq!(*client_msg.state(), localmsgnotification::State::Idle);
+        assert_eq!(reply, localmsgnotification::Reply(fake_msgs(), true));
+
+        // client sends a blocking request to server and waits for a reply from the server
+        client_msg.send_request_messages_blocking().await.unwrap();
+        assert_eq!(
+            *client_msg.state(),
+            localmsgnotification::State::BusyBlocking
+        );
+
+        let reply = client_msg.recv_next_reply().await.unwrap();
+        assert_eq!(*client_msg.state(), localmsgnotification::State::Idle);
+        assert_eq!(reply, localmsgnotification::Reply(fake_msgs(), false));
+
+        // client sends done to server
+        client_msg.send_done().await.unwrap();
+        assert_eq!(*client_msg.state(), localmsgnotification::State::Done);
+    });
+
+    tokio::try_join!(client, server).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+pub async fn local_message_submission_server_and_client_happy_path() {
+    use pallas_network::miniprotocols::localmsgsubmission::DmqMsgValidationError;
+
+    fn fake_msg() -> DmqMsg {
+        use pallas_network::miniprotocols::localmsgsubmission::{
+            DmqMsgOperationalCertificate, DmqMsgPayload,
+        };
+
+        DmqMsg {
+            msg_id: vec![1, 2, 3],
+            msg_payload: DmqMsgPayload {
+                msg_body: vec![0, 1, 2],
+                kes_period: 10,
+                expires_at: 100,
+            },
+            kes_signature: vec![0, 1, 2, 3],
+            operational_certificate: DmqMsgOperationalCertificate {
+                kes_vk: vec![1, 2, 3],
+                issue_number: 4,
+                start_kes_period: 5,
+                cert_sig: vec![6],
+            },
+            cold_verification_key: vec![0, 1, 2, 3, 4, 5],
+        }
+    }
+
+    let server = tokio::spawn({
+        async move {
+            // server setup
+            let socket_path = Path::new("node4.socket");
+            if socket_path.exists() {
+                fs::remove_file(socket_path).unwrap();
+            }
+            let listener = UnixListener::bind(socket_path).unwrap();
+            let mut server = pallas_network::facades::DmqServer::accept(&listener, 0)
+                .await
+                .unwrap();
+
+            // init local msg submission server
+            let server_msg = server.msg_submission();
+            assert_eq!(*server_msg.state(), localtxsubmission::State::Idle);
+
+            // server waits for request from client and replies to it
+            let request = server_msg.recv_next_request().await.unwrap();
+            assert_eq!(request, localtxsubmission::Request::Submit(fake_msg()));
+            assert_eq!(*server_msg.state(), localtxsubmission::State::Busy);
+
+            server_msg
+                .send_submit_tx_response(localtxsubmission::Response::Accepted)
+                .await
+                .unwrap();
+            assert_eq!(*server_msg.state(), localtxsubmission::State::Idle);
+
+            // server waits for request from client and replies to it
+            let request = server_msg.recv_next_request().await.unwrap();
+            assert_eq!(request, localtxsubmission::Request::Submit(fake_msg()));
+            assert_eq!(*server_msg.state(), localtxsubmission::State::Busy);
+
+            server_msg
+                .send_submit_tx_response(localtxsubmission::Response::Rejected(
+                    DmqMsgValidationError(DmqMsgRejectReason::Other("fake error".to_string())),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(*server_msg.state(), localtxsubmission::State::Idle);
+
+            // server receives done from client
+            let request = server_msg.recv_next_request().await.unwrap();
+            assert_eq!(request, localtxsubmission::Request::Done);
+            assert_eq!(*server_msg.state(), localtxsubmission::State::Done);
+        }
+    });
+
+    let client = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // client setup
+        let socket_path = "node4.socket";
+        let mut client = DmqClient::connect(socket_path, 0).await.unwrap();
+
+        // init local msg submission client
+        let client_msg = client.msg_submission();
+        assert_eq!(*client_msg.state(), localtxsubmission::State::Idle);
+
+        // client sends a request to server and waits for a reply from the server
+        client_msg.send_submit_tx(fake_msg()).await.unwrap();
+        assert_eq!(*client_msg.state(), localtxsubmission::State::Busy);
+
+        let response = client_msg.recv_submit_tx_response().await.unwrap();
+        assert_eq!(*client_msg.state(), localtxsubmission::State::Idle);
+        assert_eq!(response, localtxsubmission::Response::Accepted);
+
+        // client sends a request to server and waits for a reply from the server
+        client_msg.send_submit_tx(fake_msg()).await.unwrap();
+        assert_eq!(*client_msg.state(), localtxsubmission::State::Busy);
+
+        let response = client_msg.recv_submit_tx_response().await.unwrap();
+        assert_eq!(*client_msg.state(), localtxsubmission::State::Idle);
+        assert_eq!(
+            response,
+            localtxsubmission::Response::Rejected(DmqMsgValidationError(
+                DmqMsgRejectReason::Other("fake error".to_string())
+            ))
+        );
+
+        // client sends done to server
+        client_msg.terminate_gracefully().await.unwrap();
+        assert_eq!(*client_msg.state(), localtxsubmission::State::Done);
+    });
+
+    tokio::try_join!(client, server).unwrap();
+}
+
+/// What cardano-node proposes on mainnet: duplex diffusion, peer sharing on.
+fn cardano_node_proposal(magic: u64) -> handshake::n2n::VersionTable {
+    let node = VersionData::new(magic, false, Some(1), Some(false));
+
+    handshake::n2n::VersionTable {
+        values: [(13, node.clone()), (14, node)].into_iter().collect(),
+    }
+}
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bind a listener on an ephemeral localhost port.
+async fn local_listener() -> (TcpListener, std::net::SocketAddr) {
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    (listener, addr)
+}
+
+/// Run a client handshake proposing `versions` against a [`PeerServer`].
+async fn propose_to_peer_server(
+    versions: handshake::n2n::VersionTable,
+) -> (
+    handshake::Confirmation<VersionData>,
+    Result<PeerServer, pallas_network::facades::Error>,
+) {
+    let (listener, addr) = local_listener().await;
+    let server = tokio::spawn(async move { PeerServer::accept(&listener, MAINNET_MAGIC).await });
+
+    let bearer = Bearer::connect_tcp(addr).await.unwrap();
+    let mut plexer = Plexer::new(bearer);
+    let mut client_hs = handshake::N2NClient::new(plexer.subscribe_client(0));
+    let plexer = plexer.spawn();
+
+    let confirmation = tokio::time::timeout(HANDSHAKE_TIMEOUT, client_hs.handshake(versions))
+        .await
+        .expect("handshake timed out")
+        .unwrap();
+    let server = tokio::time::timeout(HANDSHAKE_TIMEOUT, server)
+        .await
+        .expect("server timed out")
+        .unwrap();
+
+    plexer.abort().await;
+    (confirmation, server)
+}
+
+/// `PeerServer` accepts a node proposing duplex diffusion with peer sharing, at the highest common version.
+#[tokio::test]
+pub async fn peer_server_accepts_a_duplex_peer_sharing_node() {
+    let (confirmation, server) = propose_to_peer_server(cardano_node_proposal(MAINNET_MAGIC)).await;
+
+    // Highest common version, negotiated data: initiator-only (ours), peer sharing
+    // disabled (ours), query off (both).
+    let negotiated = VersionData::new(MAINNET_MAGIC, true, Some(0), Some(false));
+
+    match confirmation {
+        handshake::Confirmation::Accepted(version, data) => {
+            assert_eq!(version, 14);
+            assert_eq!(data, negotiated);
+        }
+        other => panic!("expected the node to be accepted, got {other:?}"),
+    }
+
+    let server = server.unwrap();
+    assert_eq!(server.accepted_version(), Some(&(14, negotiated)));
+    server.abort().await;
+}
+
+/// `PeerServer` accepts a duplex node that proposes only a legacy (pre-v11) version.
+#[tokio::test]
+pub async fn peer_server_accepts_a_duplex_node_on_a_legacy_version() {
+    let legacy = handshake::n2n::VersionTable {
+        values: [(10, VersionData::new(MAINNET_MAGIC, false, None, None))]
+            .into_iter()
+            .collect(),
+    };
+
+    let (confirmation, server) = propose_to_peer_server(legacy).await;
+
+    let negotiated = VersionData::new(MAINNET_MAGIC, true, None, None);
+    match confirmation {
+        handshake::Confirmation::Accepted(10, data) => assert_eq!(data, negotiated),
+        other => panic!("expected version 10 to be accepted, got {other:?}"),
+    }
+
+    let server = server.unwrap();
+    assert_eq!(server.accepted_version(), Some(&(10, negotiated)));
+    server.abort().await;
+}
+
+/// Which [`handshake::Server`] method answers the client's proposal.
+#[derive(Clone, Copy)]
+enum ServerHandshake {
+    Negotiated,
+    /// The deprecated method, which requires identical version data.
+    Legacy,
+}
+
+/// Run a low-level [`handshake::Server`] against a client proposing `proposal`.
+/// The server's bearer stays open until the client has read the reply.
+async fn low_level_handshake<D>(
+    ours: handshake::VersionTable<D>,
+    proposal: handshake::VersionTable<D>,
+) -> (handshake::Confirmation<D>, Option<(u64, D)>)
+where
+    D: std::fmt::Debug
+        + Clone
+        + PartialEq
+        + handshake::NegotiateVersionData
+        + Send
+        + Sync
+        + 'static,
+    handshake::Message<D>: pallas_codec::Fragment,
+{
+    low_level_handshake_with(ServerHandshake::Negotiated, ours, proposal).await
+}
+
+/// Like [`low_level_handshake`], answering with the given server `method`.
+async fn low_level_handshake_with<D>(
+    method: ServerHandshake,
+    ours: handshake::VersionTable<D>,
+    proposal: handshake::VersionTable<D>,
+) -> (handshake::Confirmation<D>, Option<(u64, D)>)
+where
+    D: std::fmt::Debug
+        + Clone
+        + PartialEq
+        + handshake::NegotiateVersionData
+        + Send
+        + Sync
+        + 'static,
+    handshake::Message<D>: pallas_codec::Fragment,
+{
+    let (listener, addr) = local_listener().await;
+    let (read_tx, read_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        let (bearer, _) = Bearer::accept_tcp(&listener).await.unwrap();
+        let mut plexer = Plexer::new(bearer);
+        let mut server_hs = handshake::Server::<D>::new(plexer.subscribe_server(0));
+        let plexer = plexer.spawn();
+
+        let accepted = match method {
+            ServerHandshake::Negotiated => server_hs.handshake_negotiated(ours).await,
+            #[allow(deprecated)]
+            ServerHandshake::Legacy => server_hs.handshake(ours).await,
+        }
+        .unwrap();
+
+        let _ = read_rx.await;
+        plexer.abort().await;
+        accepted
+    });
+
+    let bearer = Bearer::connect_tcp(addr).await.unwrap();
+    let mut plexer = Plexer::new(bearer);
+    let mut client_hs = handshake::Client::<D>::new(plexer.subscribe_client(0));
+    let plexer = plexer.spawn();
+
+    let confirmation = tokio::time::timeout(HANDSHAKE_TIMEOUT, client_hs.handshake(proposal))
+        .await
+        .expect("handshake timed out")
+        .unwrap();
+    read_tx.send(()).unwrap();
+
+    let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, server)
+        .await
+        .expect("server timed out")
+        .unwrap();
+
+    plexer.abort().await;
+    (confirmation, accepted)
+}
+
+/// Assert that a confirmation is a refusal of `version`.
+fn assert_refused<D: std::fmt::Debug + Clone>(
+    confirmation: &handshake::Confirmation<D>,
+    version: u64,
+) {
+    assert!(
+        matches!(
+            confirmation,
+            handshake::Confirmation::Rejected(handshake::RefuseReason::Refused(v, _)) if *v == version
+        ),
+        "expected a refusal of version {version}, got {confirmation:?}"
+    );
+}
+
+/// A proposal that differs from our v14 data only in peer sharing, which the
+/// negotiated handshake settles to the lower of the two.
+fn peer_sharing_proposal() -> handshake::n2n::VersionTable {
+    handshake::n2n::VersionTable {
+        values: [(
+            14,
+            VersionData::new(MAINNET_MAGIC, true, Some(1), Some(false)),
+        )]
+        .into_iter()
+        .collect(),
+    }
+}
+
+/// The deprecated server method keeps its v1.4.0 behaviour: version data that
+/// differ in a negotiable field are refused.
+#[tokio::test]
+pub async fn handshake_server_legacy_method_refuses_differing_version_data() {
+    let (confirmation, accepted) = low_level_handshake_with(
+        ServerHandshake::Legacy,
+        handshake::n2n::VersionTable::v7_and_above(MAINNET_MAGIC),
+        peer_sharing_proposal(),
+    )
+    .await;
+
+    match &confirmation {
+        handshake::Confirmation::Rejected(handshake::RefuseReason::Refused(14, reason)) => {
+            assert_eq!(reason, "Proposed extra params don't match")
+        }
+        other => panic!("expected a refusal of version 14, got {other:?}"),
+    }
+    assert_eq!(accepted, None);
+}
+
+/// The negotiated server method accepts the proposal the legacy method refuses.
+#[tokio::test]
+pub async fn handshake_server_negotiated_method_accepts_differing_version_data() {
+    let (confirmation, accepted) = low_level_handshake(
+        handshake::n2n::VersionTable::v7_and_above(MAINNET_MAGIC),
+        peer_sharing_proposal(),
+    )
+    .await;
+
+    let negotiated = VersionData::new(MAINNET_MAGIC, true, Some(0), Some(false));
+    match confirmation {
+        handshake::Confirmation::Accepted(14, data) => assert_eq!(data, negotiated),
+        other => panic!("expected acceptance of version 14, got {other:?}"),
+    }
+    assert_eq!(accepted, Some((14, negotiated)));
+}
+
+/// Version data that only implements `PartialEq`, not `NegotiateVersionData`.
+#[derive(Debug, Clone, PartialEq)]
+struct EqualityOnlyData(u64);
+
+impl pallas_codec::minicbor::Encode<()> for EqualityOnlyData {
+    fn encode<W: pallas_codec::minicbor::encode::Write>(
+        &self,
+        e: &mut pallas_codec::minicbor::Encoder<W>,
+        _ctx: &mut (),
+    ) -> Result<(), pallas_codec::minicbor::encode::Error<W::Error>> {
+        e.u64(self.0)?;
+        Ok(())
+    }
+}
+
+impl<'b> pallas_codec::minicbor::Decode<'b, ()> for EqualityOnlyData {
+    fn decode(
+        d: &mut pallas_codec::minicbor::Decoder<'b>,
+        _ctx: &mut (),
+    ) -> Result<Self, pallas_codec::minicbor::decode::Error> {
+        Ok(Self(d.u64()?))
+    }
+}
+
+/// The deprecated server method still accepts version data without
+/// `NegotiateVersionData`, as it did in v1.4.0.
+#[tokio::test]
+pub async fn handshake_server_legacy_method_accepts_equality_only_data() {
+    let (listener, addr) = local_listener().await;
+    let table = || handshake::VersionTable {
+        values: [(1, EqualityOnlyData(7))].into_iter().collect(),
+    };
+    let ours = table();
+    let (read_tx, read_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        let (bearer, _) = Bearer::accept_tcp(&listener).await.unwrap();
+        let mut plexer = Plexer::new(bearer);
+        let mut server_hs = handshake::Server::<EqualityOnlyData>::new(plexer.subscribe_server(0));
+        let plexer = plexer.spawn();
+
+        #[allow(deprecated)]
+        let accepted = server_hs.handshake(ours).await.unwrap();
+
+        let _ = read_rx.await;
+        plexer.abort().await;
+        accepted
+    });
+
+    let bearer = Bearer::connect_tcp(addr).await.unwrap();
+    let mut plexer = Plexer::new(bearer);
+    let mut client_hs = handshake::Client::<EqualityOnlyData>::new(plexer.subscribe_client(0));
+    let plexer = plexer.spawn();
+
+    let confirmation = tokio::time::timeout(HANDSHAKE_TIMEOUT, client_hs.handshake(table()))
+        .await
+        .expect("handshake timed out")
+        .unwrap();
+    read_tx.send(()).unwrap();
+
+    let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, server)
+        .await
+        .expect("server timed out")
+        .unwrap();
+
+    plexer.abort().await;
+    assert!(matches!(
+        confirmation,
+        handshake::Confirmation::Accepted(1, EqualityOnlyData(7))
+    ));
+    assert_eq!(accepted, Some((1, EqualityOnlyData(7))));
+}
+
+/// The low-level server refuses a proposal for another network.
+#[tokio::test]
+pub async fn handshake_server_refuses_a_node_on_another_network() {
+    let (confirmation, accepted) = low_level_handshake(
+        handshake::n2n::VersionTable::v7_and_above(MAINNET_MAGIC),
+        cardano_node_proposal(1),
+    )
+    .await;
+
+    assert_refused(&confirmation, 14);
+    assert_eq!(accepted, None);
+}
+
+/// The low-level server refuses a legacy payload proposed for a modern N2N version.
+#[tokio::test]
+pub async fn handshake_server_refuses_a_legacy_payload_on_a_modern_n2n_version() {
+    let legacy_payload = handshake::n2n::VersionTable {
+        values: [(14, VersionData::new(MAINNET_MAGIC, false, None, None))]
+            .into_iter()
+            .collect(),
+    };
+
+    let (confirmation, accepted) = low_level_handshake(
+        handshake::n2n::VersionTable::v7_and_above(MAINNET_MAGIC),
+        legacy_payload,
+    )
+    .await;
+
+    assert_refused(&confirmation, 14);
+    assert_eq!(accepted, None);
+}
+
+/// The low-level server refuses a bare-magic payload proposed for a modern N2C version.
+#[tokio::test]
+pub async fn handshake_server_refuses_a_legacy_payload_on_a_modern_n2c_version() {
+    use handshake::n2c;
+
+    // N2C v16 (32784) carries a query flag; propose it without one.
+    let legacy_payload = n2c::VersionTable {
+        values: [(32784, n2c::VersionData::new(MAINNET_MAGIC, None))]
+            .into_iter()
+            .collect(),
+    };
+
+    let (confirmation, accepted) = low_level_handshake(
+        n2c::VersionTable::v10_and_above(MAINNET_MAGIC),
+        legacy_payload,
+    )
+    .await;
+
+    assert_refused(&confirmation, 32784);
+    assert_eq!(accepted, None);
+}

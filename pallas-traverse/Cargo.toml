@@ -1,0 +1,28 @@
+[package]
+name = "pallas-traverse"
+description = "Utilities to traverse over multi-era block data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/pallas-traverse"
+readme = "README.md"
+
+[dependencies]
+pallas-primitives.workspace = true
+pallas-addresses.workspace = true
+pallas-crypto.workspace = true
+pallas-codec.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+paste = "1.0.14"
+itertools.workspace = true
+
+# TODO: remove once GenesisValue moves into new genesis crate
+serde.workspace = true
+
+[features]
+unstable = ["pallas-primitives/unstable"]

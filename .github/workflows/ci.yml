@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace
+      - name: Test blueprint feature
+        run: cargo test -p pallas-network -p pallas-network2 --features blueprint
+      - name: Test unstable feature
+        run: cargo test -p pallas-primitives -p pallas-traverse -p pallas-utxorpc --features unstable
+      - name: Test unstable blueprint feature
+        run: cargo test -p pallas-primitives --features unstable,blueprint
+
+  features:
+    name: Features (${{ matrix.flags }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flags:
+          - "--no-default-features"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets ${{ matrix.flags }}
+
+  isolated-features:
+    name: Isolated no-default-features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # A workspace-wide --no-default-features build unifies features across
+      # members, so it always pulls pallas-primitives in with `json` enabled.
+      # Check the crate in isolation to catch missing serde feature gating.
+      - run: cargo check -p pallas-primitives --no-default-features
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
+  # main is the v1 lineage, where public API changes must be additive; see
+  # "API compatibility" in AGENTS.md. Other targets, such as vnext, may break.
+  #
+  # Both jobs compare the PR's merge commit with the target branch tip, so a
+  # stale PR branch doesn't read as removing newer items. Neither tool is enough
+  # alone: cargo-semver-checks catches breaks that look like additions but not
+  # type changes, and cargo-public-api is the reverse.
+  semver-checks:
+    name: API compatibility (semver-checks)
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: ${{ github.event.pull_request.base.sha }}
+          # The version alone won't do: main can sit on a prerelease.
+          release-type: minor
+
+  public-api:
+    name: API compatibility (public-api, ${{ matrix.crate }})
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The published crates. Add a new crate here once it's on main; until
+        # then the base revision doesn't have it to diff against.
+        crate:
+          - pallas
+          - pallas-addresses
+          - pallas-codec
+          - pallas-configs
+          - pallas-crypto
+          - pallas-hardano
+          - pallas-math
+          - pallas-network
+          - pallas-network2
+          - pallas-primitives
+          - pallas-traverse
+          - pallas-txbuilder
+          - pallas-utxorpc
+          - pallas-validate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+      - uses: ./.github/actions/public-api-diff
+        with:
+          crate: ${{ matrix.crate }}
+          base: ${{ github.event.pull_request.base.sha }}

@@ -1,0 +1,160 @@
+# Dijkstra block fixtures
+
+Real blocks from the Musashi testnet, as lowercase hex of the block exactly as
+the node stored it, wrapper and all, no trailing newline.
+
+| | |
+| --- | --- |
+| network | Musashi, network magic 164 |
+| node release | ouroboros-leios `prototype-2026w36` |
+| ledger commit | `1587f21a7d1306dc590c2749a5c66232ef66aad0` |
+| shelley genesis hash | `1944510a4fd91415444285231058f6f6ff0f6f3ff3d0356c76c00c5a77f29567` |
+| chain start | 2026-09-07T00:00:00Z, slot length 1, epoch length 21600 |
+| Conway to Dijkstra | last Conway block 4254 at slot 86373, first Dijkstra block 4255 at slot 86463 |
+
+The blocks were read out of the immutable chunks of a relay's chain database
+(`https://leios1-rel-a-1.play.dev.cardano.org/leios.full.tar.zst`) with
+pallas-hardano's chunk reader. Each hash is blake2b-256 of the header CBOR and
+was checked against the header hash in the node's own secondary index, together
+with the block's CRC32 and the header's offset and size.
+
+| file | chunk/index | slot | block | hash | bytes | tag | txs | why |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| conway5.block | 00079/39 | 86373 | 4254 | `802112126cc600a6afc5193a0150aafd9f6563bec28207df7e6c20cc62e95f8e` | 862 | 7 | 0 | the last block before the fork, a Conway body under a twelve element header body |
+| dijkstra1.block | 00080/0 | 86463 | 4255 | `d0c2a26a0192baf397b75cd38137987d82036c269089362842888279f3e19daf` | 862 | 8 | 0 | the first Dijkstra block, no transactions |
+| dijkstra2.block | 00080/22 | 86855 | 4277 | `adb23531ebb61891912e6a4bdabcbaaa053223d2de342eedbaa9b6af4fb526f3` | 1689 | 8 | 1 | the first certificate |
+| dijkstra3.block | 00264/18 | 285530 | 14094 | `294b3df1e6758e6f17f2b5a09ed469c6ec37c2db4d274264c8ee5edabe31229a` | 1064 | 8 | 1 | a plain transfer, the smallest block with a transaction |
+| dijkstra4.block | 00268/0 | 289441 | 14212 | `f8926da4333a3ce5fdb7b60a00d80eb23da0823c6962f06abfdee149b59dae41` | 1827 | 8 | 1 | the first auxiliary data |
+| dijkstra5.block | 00277/8 | 299514 | 14534 | `7b7c9f48ac331106e9f9ef03856090bc6275f09fca5bb4c789068d04c54b079a` | 2269 | 8 | 3 | three transactions |
+| dijkstra6.block | 00270/0 | 291625 | 14278 | `dec1d7087ff0191191fd3bac1559ae1b9c40b93ad33ec9cfba1f2e4722019a23` | 3483 | 8 | 4 | four transactions with five certificates between them |
+| dijkstra7.block | 00288/0 | 311104 | 14936 | `920a4883bf663cd3640af8ee87292edd391ff9b99debef2ba556f2f8e9d5761d` | 1232 | 8 | 1 | a one transaction block from a later chunk |
+| dijkstra8.block | 00344/8 | 371723 | 17403 | `33a48eee693522320891dd4d1da8ee33c288c854eb25337802dbc4c912571d07` | 962 | 8 | 0 | the first Leios certificate, with an announcement |
+| dijkstra9.block | 00346/20 | 374306 | 17512 | `112495349409ccaa7a57e810aa59b014337612438a3e07cd5ce1bb3126dfbbea` | 925 | 8 | 0 | a Leios certificate without an announcement |
+| dijkstra10.block | 00341/23 | 369030 | 17297 | `917c72dcd2d2222df5cc82fcebea55c4f9135e5f1491afd66d79d48d52e42f60` | 3373 | 8 | 7 | body key 3, map and array outputs, certificates, auxiliary data, a bare set |
+| dijkstra11.block | 00327/33 | 354033 | 16808 | `e45c1dc810ddfb36ffb9647eaf08861b4611fb4e872a227c00337dddf2680b8c` | 1088 | 8 | 1 | the smallest map form output |
+| dijkstra12.block | 00352/29 | 380643 | 17794 | `3e0e56a9af0cb26e0641747ca835874135d02d35a29820a5e4de6beb37c17914` | 5689 | 8 | 24 | the smallest indefinite length container |
+| dijkstra13.block | 00278/24 | 301082 | 14594 | `cf522686b27e452b3e261904058c7e323f3723e2f5c629e5a7542579b59474b4` | 1274 | 8 | 1 | certificate tag 9, vote delegation |
+| dijkstra14.block | 00574/21 | 620349 | 28687 | `9b481f4b4fa46de9a1bde085570b5fc9d90f161f99bde7f63bfe4ed20dbc37bf` | 1734 | 8 | 1 | a transaction body writing its certificate set as a bare array rather than under tag 258 |
+| dijkstra15.block | 00344/11 | 371916 | 17406 | `0db84efa0259153a240cecacd0f9e52f942d40f96b132ebd0d5b3526e19b3a7b` | 964 | 8 | 0 | an announced endorser block size of 71103, which needs the five byte uint |
+
+The `tag` column is the block wrapper tag. A Dijkstra header arriving on its
+own over chainsync carries envelope tag 7 rather than the wrapper tag 8, and
+that number was observed on a node rather than read from any file here.
+
+What each fixture's transactions carry. Every other key and shape the era
+models is exercised by no fixture and is modelled from the CDDL alone.
+
+| file | body keys | witness keys | outputs | certificate tags | set arms | indefinite | leios certificate | announcement |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| dijkstra2.block | 0, 1, 2, 4 | 0 | array | 3 | tagged | 0 | nil | nil |
+| dijkstra3.block | 0, 1, 2 | 0 | array | none | tagged | 0 | nil | nil |
+| dijkstra4.block | 0, 1, 2, 4, 7 | 0 | array | 3, 7 | tagged | 0 | nil | nil |
+| dijkstra5.block | 0, 1, 2, 4, 7 | 0 | array | 3, 7 | tagged | 0 | nil | nil |
+| dijkstra6.block | 0, 1, 2, 4, 7 | 0 | array | 2, 3, 7 | tagged | 0 | nil | nil |
+| dijkstra7.block | 0, 1, 2, 4 | 0 | array | 2 | tagged | 0 | nil | nil |
+| dijkstra8.block | none | none | none | none | none | 0 | present | present |
+| dijkstra9.block | none | none | none | none | none | 0 | present | nil |
+| dijkstra10.block | 0, 1, 2, 3, 4, 7 | 0 | map, array | 3, 7 | tagged, bare | 0 | nil | nil |
+| dijkstra11.block | 0, 1, 2 | 0 | map | none | bare | 0 | nil | nil |
+| dijkstra12.block | 0, 1, 2 | 0 | array | none | tagged | 1 | nil | nil |
+| dijkstra13.block | 0, 1, 2, 4 | 0 | array | 7, 9 | tagged | 0 | nil | nil |
+| dijkstra14.block | 0, 1, 2, 3, 4 | 0 | map | 3 | bare | 0 | nil | nil |
+| dijkstra15.block | none | none | none | none | none | 0 | present | present |
+
+## Endorser block bodies
+
+Three files are endorser block bodies, each the `endorser_block` map from
+transaction hash to transaction size in bytes, as leios-fetch delivered it,
+written as lowercase hex with no trailing newline. Each body's blake2b-256 and
+length are the `eb_hash` and `eb_size` of the `eb_announcement` in the header of
+the block named beside it.
+
+`dijkstra-17402.ebbody` was fetched on 2026-09-22 over leios-fetch from a node
+of the chain above, cardano-node `afa091b4af2795d1d9c46e59145ed16127760f7b`, at
+the point of the announcing slot and the announced hash. Block 17402 (chunk and
+index 00344/7) announces it and `dijkstra8.block` certifies it.
+
+`dijkstra-eb1.ebbody` and `dijkstra-eb2.ebbody` come from an earlier Musashi
+chain, with network magic 164 like the chain above, under node release
+`prototype-2026w35`, whose node pins cardano-ledger
+`f3104f00f9819ba94de119c38bc3e0109982821f`. They were pulled over leios-fetch
+from that chain's relay.
+Their announcing headers were cut from the same chain's immutable database, at
+chunk and index 00397/47 and 00368/27, and each header hash equals what that
+node's own secondary index records for the block.
+
+The counts, first keys and first sizes were read with a standalone CBOR walker
+and Python's `hashlib.blake2b` rather than with pallas.
+
+| file | announced at slot | announcing block | announcing header hash | bytes | blake2b-256 | transactions | first key | first size | why |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| dijkstra-eb1.ebbody | 429789 | 21507 | `abba50f39b31ca7ed67ebe72f588668073a66090a33504a76d9abbc1d6a9d3b5` | 37 | `f753a2b1e556780d36961a1cde7ba05ea3ff9a58047b03385d5242b5c4610b5c` | 1 | `a69f9fc581e5914a101a3e619f5ce64b6bce76721fd5eed0cbad0e0f6d411cc5` | 229 | the smallest body, one transaction |
+| dijkstra-eb2.ebbody | 397855 | 19847 | `779e95c2816db83f41528b1b8260034f68c8f817c4f32edadc05de0fc16f22fb` | 1082 | `8f21f4531c3d5e6cf6939821221d01bc6c4f33c6470de4b1a852dd99ea19883d` | 30 | `455a00b521f35f2c0a6ff0a59296c3316de6219af206c13d2e95870f66541fec` | 200 | thirty transactions whose keys are not in sorted order |
+| dijkstra-17402.ebbody | 371680 | 17402 | `b0e696b02f5c527b43eabf2149b71c7f9579b4e2db1dbe0c04fe67881cdb8aa9` | 8786 | `29694e6d204e586f170a1f4f75da3703cb86289d08e7eaea2def826a6dcd7e90` | 244 | `2bc50f5b4942ca304e39e7cd7f1c4261d85437ea5464b2d1a623f47790254a3d` | 201 | the body `dijkstra8.block` certifies, 244 transactions with keys not in sorted order |
+
+`pallas-primitives` decodes and re-encodes each body, and `pallas-traverse`
+asserts the blake2b-256 of `dijkstra-17402.ebbody`.
+
+## Transactions cut from the chain
+
+One file here is a single transaction rather than a whole block, read from the
+chain in the same way the blocks above were, and not hand built.
+
+| file | slot | block | transaction | what it carries |
+| --- | --- | --- | --- | --- |
+| `dijkstra-subtx.tx` | 853600 | `0c88b1e221beb608ed37dcfabed93a4a4e8f1ea0ec96f2d93b84c04816d5ddb4` | `74e2116ca6e0c809f156aa062a9d4ee8b156322618846f1bdea5d9ad7a206a12` | body keys 0, 1, 2, 13, 18, 23, where key 23 is `sub_transactions` and holds one sub transaction whose own body carries keys 0, 1, 11, 14, 18, so the file exercises `guards` at key 14 inside a sub transaction body |
+
+The file is the transaction as it sat in the block, 728 bytes in the four
+element `block_transaction` form, written as lowercase hex with no trailing
+newline. Blake2b-256 over the body alone gives the transaction hash in the
+table, and `pallas-traverse` asserts that.
+
+## Transactions with indefinite length byte strings
+
+Two transactions that write byte strings in the indefinite length form, from
+the chain with the network magic and shelley genesis hash above, read from a
+node running ouroboros-leios `prototype-2026w40a`. Each file is the three
+element mempool form (body, witness set, auxiliary data), written as lowercase
+hex with no trailing newline. Blake2b-256 over the body alone gives the
+transaction hash in the table, and `pallas-primitives` asserts that.
+
+| file | transaction | bytes | indefinite byte strings in the body | where | source |
+| --- | --- | --- | --- | --- | --- |
+| `dijkstra-indef-bytes1.tx` | `943a88c97f86522b2cda39d1d6bd076ea51a696e5ad41c41e4c6d38ce8f7dd50` | 751 | 11 | an input id, an output address, a guard key hash, a reference input id, two account keys, and in the sub transaction an input id, an output address, a guard key hash and two account keys | transaction index 137 of the ranking block at slot 3438997, `5b7dd1bd0349ff307d8fb13b826de4d8ab83ee7e41feb0d8d1c16cb0c208ee0f`, without its validity flag |
+| `dijkstra-indef-bytes2.tx` | `b026c42a9cf28aff7ce8624487f4d2b8f45df93454ac0ea2842408c1673cce5c` | 646 | 7 | an input id, two output addresses, a reference input id, and in the sub transaction an input id and two output addresses | transaction index 4825 of endorser block `4e4706aa2d7ad04581588af6efc4065f151bbe2e283f7b806c6661121b730dc4`, from the node's endorser block database |
+
+## Transactions with PlutusV4 witness scripts
+
+Two files are transactions cut from block 8 of a local network run from the
+`ghcr.io/input-output-hk/ouroboros-leios/cardano-node-testnet:rc-2026w42` image
+(cardano-node 11.2.0.164, network magic 164, every hard fork at epoch 0), at
+slot 353, header hash
+`f1524fe85164dbf31cc26f019a751e5598e439c1f67a35c59ca8e4f2f126767b`. Each is the
+transaction bytes exactly as the block holds them, in the four element `block_transaction`
+form, written as lowercase hex with no trailing newline.
+
+| file | index in block | transaction | bytes | witness keys | what it carries |
+| --- | --- | --- | --- | --- | --- |
+| `dijkstra-v4-witness.tx` | 0 | `931a78483ed17437655db1ad49b1920f4cef45b3c48c165acd42e6759933d358` | 380 | 0, 5, 8 | a spend from a PlutusV4 script, with the script at witness key 8 |
+| `dijkstra-v4-sub-witness.tx` | 1 | `a9e1e0c39a9d4536ad2cd75c6eac0aead02300adfb12e013147c21cdb8156ada` | 579 | 0 | two sub transactions, the first with witness key 0 and the second with keys 5 and 8, so the PlutusV4 script is only in a sub transaction |
+
+The script at key 8 is `450101002499` in both. The spans, witness keys and
+hashes were read with Python's `cbor2` and `hashlib` rather than with pallas.
+
+## Fixtures built rather than cut
+
+Four files here are hand built CBOR, for shapes no block on this chain
+reaches. Each is written by a builder in `pallas-traverse`, and a test there
+asserts the file is byte for byte what that builder writes, so the file and
+the builder cannot drift apart.
+
+| file | what it is |
+| --- | --- |
+| `proposal-param-change-key0.hex` | a `proposal_procedure` whose parameter change sets key 0, a key every era since Shelley has |
+| `proposal-param-change-key48.hex` | the same with key 48, `max_ref_script_size_per_endorser_block`, which only this era has |
+| `dijkstra-proposal.tx` | a `block_transaction` carrying the key 48 proposal at body key 20 |
+| `dijkstra-scripts.tx` | a `block_transaction` carrying a guard clause in its witness set, the same clause and a PlutusV4 script in its auxiliary data, and a PlutusV4 reference script on its output |
+
+The two proposal files are read by `pallas-primitives` and by
+`pallas-traverse`, and the two transaction files by `pallas-utxorpc`, so one
+set of bytes serves every crate that needs the shape.

@@ -1,0 +1,48 @@
+[package]
+name = "pallas-crypto"
+description = "Cryptographic primitives for Cardano"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+documentation = "https://docs.rs/pallas-crypto"
+readme = "README.md"
+authors.workspace = true
+
+[dependencies]
+hex.workspace = true
+cryptoxide = { version = "0.4.4" }
+thiserror.workspace = true
+rand_core = "0.10"
+serde.workspace = true
+pallas-codec.workspace = true
+
+# kes dependencies
+rand = { workspace = true, optional = true }
+rand_chacha = { version = "0.10", optional = true }
+serde_with = { workspace = true, optional = true }
+ed25519-dalek = { version = "2", features = ["serde"], optional = true }
+zeroize = { version = "1.8.1", optional = true }
+
+[dev-dependencies]
+criterion = "0.8"
+itertools.workspace = true
+quickcheck = "1.0"
+quickcheck_macros = "1.0"
+proptest.workspace = true
+serde_json.workspace = true
+serde_test = "1.0.143"
+
+[features]
+default = []
+sk_clone_enabled = []
+kes = ["rand", "rand_chacha", "serde_with", "ed25519-dalek", "zeroize"]
+relaxed = []
+
+[[bench]]
+harness = false
+name = "summed_kes_benches"
+path = "./src/kes/summed_kes_benches.rs"
+required-features = ["kes"]

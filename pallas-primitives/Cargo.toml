@@ -1,0 +1,30 @@
+[package]
+name = "pallas-primitives"
+description = "Ledger primitives and cbor codec for the different Cardano eras"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+documentation = "https://docs.rs/pallas-primitives"
+readme = "README.md"
+authors.workspace = true
+
+[dependencies]
+hex.workspace = true
+pallas-crypto.workspace = true
+pallas-codec.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true, features = ["alloc"] }
+test-case = "3.3.1"
+
+[features]
+json = ["serde_json"]
+default = ["json"]
+relaxed = ["pallas-crypto/relaxed"]
+unstable = []
+blueprint = []

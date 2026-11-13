@@ -1,0 +1,38 @@
+[package]
+name = "pallas-network"
+description = "Ouroboros networking stack using async IO"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+documentation = "https://docs.rs/pallas"
+readme = "README.md"
+authors.workspace = true
+
+[dependencies]
+byteorder.workspace = true
+hex.workspace = true
+itertools.workspace = true
+pallas-codec.workspace = true
+pallas-crypto.workspace = true
+rand.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = [
+    "rt",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "macros",
+] }
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = "0.3.16"
+tokio = { version = "1", features = ["full"] }
+
+[features]
+blueprint = []

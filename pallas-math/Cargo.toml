@@ -1,0 +1,25 @@
+[package]
+name = "pallas-math"
+description = "Mathematics functions for Cardano"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+documentation = "https://docs.rs/pallas-math"
+readme = "README.md"
+authors.workspace = true
+exclude = ["tests/data/*"]
+
+[dependencies]
+dashu-int = "0.4.1"
+dashu-base = "0.4.1"
+regex = "1.10.5"
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+flate2 = "1"
+sha2 = "0.10"
+serde_json.workspace = true
